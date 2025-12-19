@@ -1,9 +1,9 @@
-# backendapp.py
 from fastapi import FastAPI, HTTPException, Depends, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from passlib.context import CryptContext
 
 import uvicorn
 import os
@@ -27,6 +27,17 @@ if not OPENAI_API_KEY:
     print("⚠ WARNING: OPENAI_API_KEY not set. AI will run in ECHO mode.")
 
 # -------------------------------------------------
+# PASSWORD HASHING
+# -------------------------------------------------
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(password: str, hashed: str) -> bool:
+    return pwd_context.verify(password, hashed)
+
+# -------------------------------------------------
 # APP INIT
 # -------------------------------------------------
 app = FastAPI(
@@ -46,7 +57,7 @@ app.add_middleware(
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 # -------------------------------------------------
-# ROOT (VERY IMPORTANT)
+# ROOT
 # -------------------------------------------------
 @app.get("/")
 def root():
@@ -72,7 +83,9 @@ def health():
 # IN-MEMORY DATABASE (MVP)
 # -------------------------------------------------
 USERS = {
-    "demo": {"password": "password123"}
+    "demo": {
+        "password": hash_password("password123")
+    }
 }
 
 CREDITS = {
@@ -86,7 +99,6 @@ class User(BaseModel):
     username: str
     password: str
 
-
 class TokenResp(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -98,10 +110,9 @@ def create_token(username: str):
     payload = {
         "sub": username,
         "iat": int(time.time()),
-        "exp": int(time.time()) + 60 * 60 * 24
+        "exp": int(time.time()) + 60 * 60 * 24  # 24h
     }
     return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
-
 
 def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
@@ -123,15 +134,16 @@ def signup(user: User):
     if user.username in USERS:
         raise HTTPException(status_code=400, detail="User exists")
 
-    USERS[user.username] = {"password": user.password}
+    USERS[user.username] = {
+        "password": hash_password(user.password)
+    }
     CREDITS[user.username] = 20
-    return {"ok": True}
-
+    return {"ok": True, "message": "User created"}
 
 @app.post("/token", response_model=TokenResp)
 def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    u = USERS.get(form_data.username)
-    if not u or u["password"] != form_data.password:
+    user = USERS.get(form_data.username)
+    if not user or not verify_password(form_data.password, user["password"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     token = create_token(form_data.username)
@@ -142,7 +154,10 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
 # -------------------------------------------------
 @app.get("/me")
 def me(user: str = Depends(get_current_user)):
-    return {"username": user, "credits": CREDITS.get(user, 0)}
+    return {
+        "username": user,
+        "credits": CREDITS.get(user, 0)
+    }
 
 # -------------------------------------------------
 # AI CHAT
@@ -178,6 +193,8 @@ def ai_chat(payload: dict, user: str = Depends(get_current_user)):
         timeout=30
     )
 
+    if r.status_code == 429:
+        raise HTTPException(status_code=429, detail="AI busy. Try again later.")
     if r.status_code != 200:
         raise HTTPException(status_code=500, detail="OpenAI API error")
 
