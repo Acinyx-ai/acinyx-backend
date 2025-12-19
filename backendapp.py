@@ -1,3 +1,5 @@
+# backendapp.py
+
 from fastapi import FastAPI, HTTPException, Depends, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -7,7 +9,7 @@ from passlib.context import CryptContext
 
 import uvicorn
 import os
-import jwt
+import jwt  # PyJWT
 import time
 import shutil
 import requests
@@ -31,11 +33,14 @@ if not OPENAI_API_KEY:
 # -------------------------------------------------
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+
 def hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
+
 def verify_password(password: str, hashed: str) -> bool:
     return pwd_context.verify(password, hashed)
+
 
 # -------------------------------------------------
 # APP INIT
@@ -48,7 +53,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # tighten later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -99,6 +104,7 @@ class User(BaseModel):
     username: str
     password: str
 
+
 class TokenResp(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -106,15 +112,16 @@ class TokenResp(BaseModel):
 # -------------------------------------------------
 # HELPERS
 # -------------------------------------------------
-def create_token(username: str):
+def create_token(username: str) -> str:
     payload = {
         "sub": username,
         "iat": int(time.time()),
-        "exp": int(time.time()) + 60 * 60 * 24  # 24h
+        "exp": int(time.time()) + 60 * 60 * 24  # 24 hours
     }
     return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
 
-def get_current_user(token: str = Depends(oauth2_scheme)):
+
+def get_current_user(token: str = Depends(oauth2_scheme)) -> str:
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
         username = payload.get("sub")
@@ -132,22 +139,25 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
 @app.post("/signup")
 def signup(user: User):
     if user.username in USERS:
-        raise HTTPException(status_code=400, detail="User exists")
+        raise HTTPException(status_code=400, detail="User already exists")
 
     USERS[user.username] = {
         "password": hash_password(user.password)
     }
     CREDITS[user.username] = 20
-    return {"ok": True, "message": "User created"}
+
+    return {"ok": True, "message": "User created successfully"}
+
 
 @app.post("/token", response_model=TokenResp)
 def login(form_data: OAuth2PasswordRequestForm = Depends()):
     user = USERS.get(form_data.username)
+
     if not user or not verify_password(form_data.password, user["password"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     token = create_token(form_data.username)
-    return {"access_token": token}
+    return {"access_token": token, "token_type": "bearer"}
 
 # -------------------------------------------------
 # USER INFO
@@ -174,7 +184,10 @@ def ai_chat(payload: dict, user: str = Depends(get_current_user)):
     CREDITS[user] -= 1
 
     if not OPENAI_API_KEY:
-        return {"response": f"ECHO: {text}", "credits_left": CREDITS[user]}
+        return {
+            "response": f"ECHO: {text}",
+            "credits_left": CREDITS[user]
+        }
 
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -271,7 +284,7 @@ def upload(file: UploadFile = File(...), user: str = Depends(get_current_user)):
     return {"url": f"/uploads/{file.filename}"}
 
 # -------------------------------------------------
-# RUN (LOCAL ONLY)
+# RUN
 # -------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
