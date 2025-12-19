@@ -26,7 +26,14 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     print("⚠ WARNING: OPENAI_API_KEY not set. AI will run in ECHO mode.")
 
-app = FastAPI(title="Acinyx.AI API", version="0.1.0")
+# -------------------------------------------------
+# APP INIT
+# -------------------------------------------------
+app = FastAPI(
+    title="Acinyx.AI API",
+    version="0.1.0",
+    description="Backend API for Acinyx AI services"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,6 +44,29 @@ app.add_middleware(
 )
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+# -------------------------------------------------
+# ROOT (VERY IMPORTANT)
+# -------------------------------------------------
+@app.get("/")
+def root():
+    return {
+        "status": "ok",
+        "service": "Acinyx.AI backend",
+        "message": "Backend is live 🚀",
+        "version": "0.1.0"
+    }
+
+# -------------------------------------------------
+# HEALTH CHECK
+# -------------------------------------------------
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy",
+        "service": "Acinyx.AI backend",
+        "version": "0.1.0"
+    }
 
 # -------------------------------------------------
 # IN-MEMORY DATABASE (MVP)
@@ -84,17 +114,6 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
         raise HTTPException(status_code=401, detail="Token expired")
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
-
-# -------------------------------------------------
-# HEALTH CHECK
-# -------------------------------------------------
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "service": "Acinyx.AI backend",
-        "version": "0.1.0"
-    }
 
 # -------------------------------------------------
 # AUTH
@@ -235,7 +254,8 @@ def upload(file: UploadFile = File(...), user: str = Depends(get_current_user)):
     return {"url": f"/uploads/{file.filename}"}
 
 # -------------------------------------------------
-# RUN
+# RUN (LOCAL ONLY)
 # -------------------------------------------------
 if __name__ == "__main__":
-    uvicorn.run("backendapp:app", host="0.0.0.0", port=5000, reload=True)
+    port = int(os.getenv("PORT", 5000))
+    uvicorn.run("backendapp:app", host="0.0.0.0", port=port)
