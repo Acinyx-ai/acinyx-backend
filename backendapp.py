@@ -1,291 +1,275 @@
-# backendapp.py
-
-from fastapi import FastAPI, HTTPException, Depends, File, UploadFile
+from fastapi import (
+    FastAPI, HTTPException, Depends,
+    UploadFile, File, Form
+)
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
-from dotenv import load_dotenv
+
+from sqlalchemy import Column, Integer, String, create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
+
 from passlib.context import CryptContext
 
+import os, time, base64
+from openai import OpenAI
+from PIL import Image, ImageDraw
 import uvicorn
-import os
-import jwt  # PyJWT
-import time
-import shutil
-import requests
 
-# -------------------------------------------------
-# LOAD ENVIRONMENT VARIABLES
-# -------------------------------------------------
-load_dotenv()
-
-# -------------------------------------------------
-# CONFIG
-# -------------------------------------------------
-SECRET_KEY = os.getenv("SECRET_KEY", "change_this_secret")
+# =================================================
+# ENV
+# =================================================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
 if not OPENAI_API_KEY:
-    print("⚠ WARNING: OPENAI_API_KEY not set. AI will run in ECHO mode.")
+    raise RuntimeError("OPENAI_API_KEY not set")
 
-# -------------------------------------------------
-# PASSWORD HASHING
-# -------------------------------------------------
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-
-def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
-
-
-def verify_password(password: str, hashed: str) -> bool:
-    return pwd_context.verify(password, hashed)
-
-
-# -------------------------------------------------
-# APP INIT
-# -------------------------------------------------
-app = FastAPI(
-    title="Acinyx.AI API",
-    version="0.1.0",
-    description="Backend API for Acinyx AI services"
+# =================================================
+# DATABASE
+# =================================================
+DATABASE_URL = "sqlite:///./acinyx.db"
+engine = create_engine(
+    DATABASE_URL, connect_args={"check_same_thread": False}
 )
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    username = Column(String, unique=True, index=True)
+    email = Column(String, unique=True, index=True)
+    password_hash = Column(String)
+    plan = Column(String, default="free")
+    chat_used = Column(Integer, default=0)
+    poster_used = Column(Integer, default=0)
+
+Base.metadata.create_all(bind=engine)
+
+# =================================================
+# APP
+# =================================================
+app = FastAPI(title="Acinyx.AI Backend", version="3.7.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# =================================================
+# SECURITY
+# =================================================
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-# -------------------------------------------------
-# ROOT
-# -------------------------------------------------
-@app.get("/")
-def root():
-    return {
-        "status": "ok",
-        "service": "Acinyx.AI backend",
-        "message": "Backend is live 🚀",
-        "version": "0.1.0"
-    }
+def hash_password(p): 
+    return pwd_context.hash(p)
 
-# -------------------------------------------------
-# HEALTH CHECK
-# -------------------------------------------------
-@app.get("/health")
-def health():
-    return {
-        "status": "healthy",
-        "service": "Acinyx.AI backend",
-        "version": "0.1.0"
-    }
+def verify_password(p, h): 
+    return pwd_context.verify(p, h)
 
-# -------------------------------------------------
-# IN-MEMORY DATABASE (MVP)
-# -------------------------------------------------
-USERS = {
-    "demo": {
-        "password": hash_password("password123")
-    }
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# =================================================
+# PLANS (UPDATED)
+# =================================================
+PLANS = {
+    "free": {
+        "chat": 5,
+        "poster": 2,
+        "watermark": True
+    },
+    "basic": {
+        "chat": 100,
+        "poster": 20,
+        "watermark": False   # ✅ REMOVED watermark
+    },
+    "pro": {
+        "chat": 500,
+        "poster": 100,
+        "watermark": False
+    },
+    "mega": {
+        "chat": 2000,
+        "poster": 300,
+        "watermark": False
+    },
 }
 
-CREDITS = {
-    "demo": 20
-}
+# =================================================
+# FILE SYSTEM
+# =================================================
+os.makedirs("outputs", exist_ok=True)
+app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
 
-# -------------------------------------------------
-# MODELS
-# -------------------------------------------------
-class User(BaseModel):
+# =================================================
+# AUTH
+# =================================================
+class SignupBody(BaseModel):
     username: str
+    email: str
     password: str
 
-
-class TokenResp(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-
-# -------------------------------------------------
-# HELPERS
-# -------------------------------------------------
-def create_token(username: str) -> str:
-    payload = {
-        "sub": username,
-        "iat": int(time.time()),
-        "exp": int(time.time()) + 60 * 60 * 24  # 24 hours
-    }
-    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
-
-
-def get_current_user(token: str = Depends(oauth2_scheme)) -> str:
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        username = payload.get("sub")
-        if username in USERS:
-            return username
-        raise HTTPException(status_code=401, detail="Invalid user")
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-# -------------------------------------------------
-# AUTH
-# -------------------------------------------------
 @app.post("/signup")
-def signup(user: User):
-    if user.username in USERS:
-        raise HTTPException(status_code=400, detail="User already exists")
+def signup(data: SignupBody, db: Session = Depends(get_db)):
+    if db.query(User).filter(User.username == data.username).first():
+        raise HTTPException(400, "User exists")
 
-    USERS[user.username] = {
-        "password": hash_password(user.password)
-    }
-    CREDITS[user.username] = 20
+    db.add(User(
+        username=data.username,
+        email=data.email,
+        password_hash=hash_password(data.password)
+    ))
+    db.commit()
+    return {"message": "Account created"}
 
-    return {"ok": True, "message": "User created successfully"}
+@app.post("/token")
+def login(
+    form: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db)
+):
+    user = db.query(User).filter(User.username == form.username).first()
+    if not user or not verify_password(form.password, user.password_hash):
+        raise HTTPException(401, "Invalid credentials")
 
-
-@app.post("/token", response_model=TokenResp)
-def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = USERS.get(form_data.username)
-
-    if not user or not verify_password(form_data.password, user["password"]):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-
-    token = create_token(form_data.username)
-    return {"access_token": token, "token_type": "bearer"}
-
-# -------------------------------------------------
-# USER INFO
-# -------------------------------------------------
-@app.get("/me")
-def me(user: str = Depends(get_current_user)):
     return {
-        "username": user,
-        "credits": CREDITS.get(user, 0)
+        "access_token": f"demo-token-{user.username}",
+        "token_type": "bearer",
+        "plan": user.plan
     }
 
-# -------------------------------------------------
+# =================================================
 # AI CHAT
-# -------------------------------------------------
+# =================================================
 @app.post("/ai/chat")
-def ai_chat(payload: dict, user: str = Depends(get_current_user)):
-    if CREDITS.get(user, 0) < 1:
-        raise HTTPException(status_code=402, detail="Insufficient credits")
+async def ai_chat(
+    message: str = Form(None),
+    image: UploadFile = File(None),
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db)
+):
+    username = token.replace("demo-token-", "")
+    user = db.query(User).filter(User.username == username).first()
 
-    text = payload.get("text", "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="Empty prompt")
+    if not user:
+        raise HTTPException(401, "Invalid token")
 
-    CREDITS[user] -= 1
+    if user.chat_used >= PLANS[user.plan]["chat"]:
+        raise HTTPException(403, "Chat limit reached")
 
-    if not OPENAI_API_KEY:
-        return {
-            "response": f"ECHO: {text}",
-            "credits_left": CREDITS[user]
-        }
+    if not message and not image:
+        raise HTTPException(422, "Message or image required")
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    messages = [
+        {"role": "system", "content": "You are Acinyx.AI. Analyze images when provided."}
+    ]
 
-    body = {
-        "model": "gpt-4o-mini",
-        "messages": [{"role": "user", "content": text}]
-    }
+    if image:
+        encoded = base64.b64encode(await image.read()).decode()
+        mime = image.content_type or "image/png"
 
-    r = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        json=body,
-        headers=headers,
-        timeout=30
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": message or "Analyze this image"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{encoded}"}
+                }
+            ]
+        })
+    else:
+        messages.append({"role": "user", "content": message})
+
+    response = client.chat.completions.create(
+        model="gpt-4.1-mini",
+        messages=messages,
+        temperature=0.6
     )
 
-    if r.status_code == 429:
-        raise HTTPException(status_code=429, detail="AI busy. Try again later.")
-    if r.status_code != 200:
-        raise HTTPException(status_code=500, detail="OpenAI API error")
+    user.chat_used += 1
+    db.commit()
 
-    content = r.json()["choices"][0]["message"]["content"]
-    return {"response": content, "credits_left": CREDITS[user]}
+    return {"reply": response.choices[0].message.content}
 
-# -------------------------------------------------
-# WHATSAPP AGENT (SIMULATION)
-# -------------------------------------------------
-@app.post("/agent/whatsapp")
-def whatsapp_agent(payload: dict, user: str = Depends(get_current_user)):
-    if CREDITS.get(user, 0) < 1:
-        raise HTTPException(status_code=402, detail="Insufficient credits")
+# =================================================
+# AI POSTER
+# =================================================
+SIZE_MAP = {
+    "portrait": "1024x1536",
+    "square": "1024x1024",
+    "landscape": "1536x1024",
+    "instagram": "1080x1920",
+}
 
-    message = payload.get("message", "").strip()
-    if not message:
-        raise HTTPException(status_code=400, detail="Empty message")
+@app.post("/ai/poster/ai-generate")
+async def ai_poster(
+    title: str = Form(""),
+    description: str = Form(""),
+    style: str = Form("cinematic"),
+    size: str = Form("portrait"),
+    image: UploadFile = File(None),
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db)
+):
+    username = token.replace("demo-token-", "")
+    user = db.query(User).filter(User.username == username).first()
 
-    CREDITS[user] -= 1
+    if not user:
+        raise HTTPException(401, "Invalid token")
 
-    return {
-        "reply": f"🤖 Acinyx WhatsApp Agent received: '{message}'",
-        "credits_left": CREDITS[user]
-    }
+    if user.poster_used >= PLANS[user.plan]["poster"]:
+        raise HTTPException(403, "Poster limit reached")
 
-# -------------------------------------------------
-# AI IMAGE
-# -------------------------------------------------
-@app.post("/ai/image")
-def ai_image(payload: dict, user: str = Depends(get_current_user)):
-    if CREDITS.get(user, 0) < 2:
-        raise HTTPException(status_code=402, detail="Insufficient credits")
+    image_size = SIZE_MAP.get(size, "1024x1536")
 
-    prompt = payload.get("prompt", "").strip()
-    if not prompt:
-        raise HTTPException(status_code=400, detail="Empty prompt")
+    prompt = f"""
+    Create a {style} poster.
+    Cinematic lighting, professional quality.
+    Subject: {title}
+    Description: {description}
+    """
 
-    CREDITS[user] -= 2
-
-    if not OPENAI_API_KEY:
-        return {
-            "image_url": "https://placehold.co/600x400?text=Acinyx+AI+Image",
-            "credits_left": CREDITS[user]
-        }
-
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-    body = {"prompt": prompt, "size": "1024x1024"}
-
-    r = requests.post(
-        "https://api.openai.com/v1/images/generations",
-        json=body,
-        headers=headers,
-        timeout=30
+    img = client.images.generate(
+        model="gpt-image-1",
+        prompt=prompt,
+        size=image_size
     )
 
-    if r.status_code != 200:
-        raise HTTPException(status_code=500, detail="Image API error")
+    image_bytes = base64.b64decode(img.data[0].b64_json)
+    filename = f"poster_{int(time.time())}.png"
+    path = f"outputs/{filename}"
 
-    url = r.json()["data"][0]["url"]
-    return {"image_url": url, "credits_left": CREDITS[user]}
-
-# -------------------------------------------------
-# FILE UPLOAD
-# -------------------------------------------------
-@app.post("/upload")
-def upload(file: UploadFile = File(...), user: str = Depends(get_current_user)):
-    uploads_dir = "uploads"
-    os.makedirs(uploads_dir, exist_ok=True)
-
-    path = os.path.join(uploads_dir, file.filename)
     with open(path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+        f.write(image_bytes)
 
-    return {"url": f"/uploads/{file.filename}"}
+    if PLANS[user.plan]["watermark"]:
+        im = Image.open(path).convert("RGBA")
+        draw = ImageDraw.Draw(im)
+        draw.text((20, im.height - 40), "Acinyx.AI", fill=(255, 255, 255, 160))
+        im.save(path)
 
-# -------------------------------------------------
+    user.poster_used += 1
+    db.commit()
+
+    return {"poster_url": f"/outputs/{filename}"}
+
+# =================================================
 # RUN
-# -------------------------------------------------
+# =================================================
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    uvicorn.run("backendapp:app", host="0.0.0.0", port=port)
+    uvicorn.run(
+        "backendapp:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True
+    )
