@@ -3,7 +3,7 @@ uvicorn[standard]==0.22.0
 python-jose==3.3.0
 pydantic==1.10.7
 requests==2.31.0
-python-multipart==0.0.6
+python-multipart==0.0.22
 pyjwt==2.8.0
 passlib[bcrypt]
 
