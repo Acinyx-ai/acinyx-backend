@@ -7,3 +7,4 @@ python-multipart==0.0.6
 pyjwt==2.8.0
 passlib[bcrypt]
 sqlalchemy
+zipp>=3.19.1 # not directly required, pinned by Snyk to avoid a vulnerability
