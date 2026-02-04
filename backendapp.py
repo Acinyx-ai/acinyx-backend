@@ -12,6 +12,9 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 from passlib.context import CryptContext
 
+from datetime import datetime, timedelta
+from jose import jwt, JWTError
+
 import os, time, base64
 from openai import OpenAI
 from PIL import Image, ImageDraw
@@ -23,6 +26,10 @@ import uvicorn
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY not set")
+
+JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_SECRET")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_MINUTES = 60 * 24
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -36,6 +43,7 @@ engine = create_engine(
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
+
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
@@ -46,12 +54,13 @@ class User(Base):
     chat_used = Column(Integer, default=0)
     poster_used = Column(Integer, default=0)
 
+
 Base.metadata.create_all(bind=engine)
 
 # =================================================
 # APP
 # =================================================
-app = FastAPI(title="Acinyx.AI Backend", version="3.7.0")
+app = FastAPI(title="Acinyx.AI Backend", version="3.8.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -66,11 +75,14 @@ app.add_middleware(
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-def hash_password(p): 
+
+def hash_password(p):
     return pwd_context.hash(p)
 
-def verify_password(p, h): 
+
+def verify_password(p, h):
     return pwd_context.verify(p, h)
+
 
 def get_db():
     db = SessionLocal()
@@ -79,8 +91,38 @@ def get_db():
     finally:
         db.close()
 
+
 # =================================================
-# PLANS (UPDATED)
+# JWT helpers
+# =================================================
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=JWT_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db)
+):
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        username: str | None = payload.get("sub")
+        if not username:
+            raise HTTPException(status_code=401, detail="Invalid token")
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    return user
+
+
+# =================================================
+# PLANS
 # =================================================
 PLANS = {
     "free": {
@@ -91,7 +133,7 @@ PLANS = {
     "basic": {
         "chat": 100,
         "poster": 20,
-        "watermark": False   # ✅ REMOVED watermark
+        "watermark": False
     },
     "pro": {
         "chat": 500,
@@ -119,6 +161,7 @@ class SignupBody(BaseModel):
     email: str
     password: str
 
+
 @app.post("/signup")
 def signup(data: SignupBody, db: Session = Depends(get_db)):
     if db.query(User).filter(User.username == data.username).first():
@@ -130,7 +173,9 @@ def signup(data: SignupBody, db: Session = Depends(get_db)):
         password_hash=hash_password(data.password)
     ))
     db.commit()
+
     return {"message": "Account created"}
+
 
 @app.post("/token")
 def login(
@@ -141,11 +186,14 @@ def login(
     if not user or not verify_password(form.password, user.password_hash):
         raise HTTPException(401, "Invalid credentials")
 
+    access_token = create_access_token({"sub": user.username})
+
     return {
-        "access_token": f"demo-token-{user.username}",
+        "access_token": access_token,
         "token_type": "bearer",
         "plan": user.plan
     }
+
 
 # =================================================
 # AI CHAT
@@ -154,14 +202,9 @@ def login(
 async def ai_chat(
     message: str = Form(None),
     image: UploadFile = File(None),
-    token: str = Depends(oauth2_scheme),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    username = token.replace("demo-token-", "")
-    user = db.query(User).filter(User.username == username).first()
-
-    if not user:
-        raise HTTPException(401, "Invalid token")
 
     if user.chat_used >= PLANS[user.plan]["chat"]:
         raise HTTPException(403, "Chat limit reached")
@@ -201,6 +244,7 @@ async def ai_chat(
 
     return {"reply": response.choices[0].message.content}
 
+
 # =================================================
 # AI POSTER
 # =================================================
@@ -211,6 +255,7 @@ SIZE_MAP = {
     "instagram": "1080x1920",
 }
 
+
 @app.post("/ai/poster/ai-generate")
 async def ai_poster(
     title: str = Form(""),
@@ -218,14 +263,9 @@ async def ai_poster(
     style: str = Form("cinematic"),
     size: str = Form("portrait"),
     image: UploadFile = File(None),
-    token: str = Depends(oauth2_scheme),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    username = token.replace("demo-token-", "")
-    user = db.query(User).filter(User.username == username).first()
-
-    if not user:
-        raise HTTPException(401, "Invalid token")
 
     if user.poster_used >= PLANS[user.plan]["poster"]:
         raise HTTPException(403, "Poster limit reached")
@@ -233,11 +273,11 @@ async def ai_poster(
     image_size = SIZE_MAP.get(size, "1024x1536")
 
     prompt = f"""
-    Create a {style} poster.
-    Cinematic lighting, professional quality.
-    Subject: {title}
-    Description: {description}
-    """
+Create a {style} poster.
+Cinematic lighting, professional quality.
+Subject: {title}
+Description: {description}
+"""
 
     img = client.images.generate(
         model="gpt-image-1",
@@ -262,6 +302,7 @@ async def ai_poster(
     db.commit()
 
     return {"poster_url": f"/outputs/{filename}"}
+
 
 # =================================================
 # RUN
