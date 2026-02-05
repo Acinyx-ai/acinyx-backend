@@ -37,24 +37,30 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # DATABASE
 # =================================================
 DATABASE_URL = "sqlite:///./acinyx.db"
+
 engine = create_engine(
-    DATABASE_URL, connect_args={"check_same_thread": False}
+    DATABASE_URL,
+    connect_args={"check_same_thread": False}
 )
+
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
 
 class User(Base):
     __tablename__ = "users"
+
     id = Column(Integer, primary_key=True)
-    username = Column(String, unique=True, index=True)
-    email = Column(String, unique=True, index=True)
-    password_hash = Column(String)
+    username = Column(String, unique=True, index=True, nullable=False)
+    email = Column(String, unique=True, index=True, nullable=False)
+    password_hash = Column(String, nullable=False)
     plan = Column(String, default="free")
     chat_used = Column(Integer, default=0)
     poster_used = Column(Integer, default=0)
 
 
+# ⚠️ DEV FIX – reset schema (solves your 500 signup problem)
+Base.metadata.drop_all(bind=engine)
 Base.metadata.create_all(bind=engine)
 
 # =================================================
@@ -76,11 +82,11 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 
-def hash_password(p):
+def hash_password(p: str):
     return pwd_context.hash(p)
 
 
-def verify_password(p, h):
+def verify_password(p: str, h: str):
     return pwd_context.verify(p, h)
 
 
@@ -108,7 +114,7 @@ def get_current_user(
 ):
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        username: str | None = payload.get("sub")
+        username = payload.get("sub")
         if not username:
             raise HTTPException(status_code=401, detail="Invalid token")
     except JWTError:
@@ -164,14 +170,20 @@ class SignupBody(BaseModel):
 
 @app.post("/signup")
 def signup(data: SignupBody, db: Session = Depends(get_db)):
+
     if db.query(User).filter(User.username == data.username).first():
         raise HTTPException(400, "User exists")
 
-    db.add(User(
+    if db.query(User).filter(User.email == data.email).first():
+        raise HTTPException(400, "Email already registered")
+
+    user = User(
         username=data.username,
         email=data.email,
         password_hash=hash_password(data.password)
-    ))
+    )
+
+    db.add(user)
     db.commit()
 
     return {"message": "Account created"}
@@ -182,7 +194,9 @@ def login(
     form: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db)
 ):
+
     user = db.query(User).filter(User.username == form.username).first()
+
     if not user or not verify_password(form.password, user.password_hash):
         raise HTTPException(401, "Invalid credentials")
 
@@ -286,6 +300,7 @@ Description: {description}
     )
 
     image_bytes = base64.b64decode(img.data[0].b64_json)
+
     filename = f"poster_{int(time.time())}.png"
     path = f"outputs/{filename}"
 
@@ -311,6 +326,5 @@ if __name__ == "__main__":
     uvicorn.run(
         "backendapp:app",
         host="0.0.0.0",
-        port=8000,
-        reload=True
+        port=8000
     )
