@@ -1,7 +1,4 @@
-from fastapi import (
-    FastAPI, HTTPException, Depends,
-    UploadFile, File, Form
-)
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -15,14 +12,20 @@ from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from jose import jwt, JWTError
 
-import os, time, base64
+import os
+import time
+import base64
+
 from openai import OpenAI
 from PIL import Image, ImageDraw
+
 import uvicorn
+
 
 # =================================================
 # ENV
 # =================================================
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY not set")
@@ -31,11 +34,15 @@ JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_SECRET")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_MINUTES = 60 * 24
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# IMPORTANT: do NOT pass proxies / http client here
+# Render + openai + httpx mismatch was causing your crash
+client = OpenAI()
+
 
 # =================================================
 # DATABASE
 # =================================================
+
 DATABASE_URL = "sqlite:///./acinyx.db"
 
 engine = create_engine(
@@ -43,14 +50,15 @@ engine = create_engine(
     connect_args={"check_same_thread": False}
 )
 
-SessionLocal = sessionmaker(bind=engine)
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+
 Base = declarative_base()
 
 
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(Integer, primary_key=True)
+    id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True, nullable=False)
     email = Column(String, unique=True, index=True, nullable=False)
     password_hash = Column(String, nullable=False)
@@ -59,14 +67,18 @@ class User(Base):
     poster_used = Column(Integer, default=0)
 
 
-# ⚠️ DEV FIX – reset schema (solves your 500 signup problem)
+# -------------------------------------------------
+# DEV RESET (needed because your schema kept breaking)
+# -------------------------------------------------
 Base.metadata.drop_all(bind=engine)
 Base.metadata.create_all(bind=engine)
+
 
 # =================================================
 # APP
 # =================================================
-app = FastAPI(title="Acinyx.AI Backend", version="3.8.0")
+
+app = FastAPI(title="Acinyx.AI Backend", version="3.8.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -75,19 +87,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # =================================================
 # SECURITY
 # =================================================
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 
-def hash_password(p: str):
-    return pwd_context.hash(p)
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
 
 
-def verify_password(p: str, h: str):
-    return pwd_context.verify(p, h)
+def verify_password(password: str, password_hash: str) -> bool:
+    return pwd_context.verify(password, password_hash)
 
 
 def get_db():
@@ -99,8 +113,9 @@ def get_db():
 
 
 # =================================================
-# JWT helpers
+# JWT
 # =================================================
+
 def create_access_token(data: dict):
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(minutes=JWT_EXPIRE_MINUTES)
@@ -130,38 +145,27 @@ def get_current_user(
 # =================================================
 # PLANS
 # =================================================
+
 PLANS = {
-    "free": {
-        "chat": 5,
-        "poster": 2,
-        "watermark": True
-    },
-    "basic": {
-        "chat": 100,
-        "poster": 20,
-        "watermark": False
-    },
-    "pro": {
-        "chat": 500,
-        "poster": 100,
-        "watermark": False
-    },
-    "mega": {
-        "chat": 2000,
-        "poster": 300,
-        "watermark": False
-    },
+    "free": {"chat": 5, "poster": 2, "watermark": True},
+    "basic": {"chat": 100, "poster": 20, "watermark": False},
+    "pro": {"chat": 500, "poster": 100, "watermark": False},
+    "mega": {"chat": 2000, "poster": 300, "watermark": False},
 }
+
 
 # =================================================
 # FILE SYSTEM
 # =================================================
+
 os.makedirs("outputs", exist_ok=True)
 app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
+
 
 # =================================================
 # AUTH
 # =================================================
+
 class SignupBody(BaseModel):
     username: str
     email: str
@@ -172,10 +176,10 @@ class SignupBody(BaseModel):
 def signup(data: SignupBody, db: Session = Depends(get_db)):
 
     if db.query(User).filter(User.username == data.username).first():
-        raise HTTPException(400, "User exists")
+        raise HTTPException(status_code=400, detail="User exists")
 
     if db.query(User).filter(User.email == data.email).first():
-        raise HTTPException(400, "Email already registered")
+        raise HTTPException(status_code=400, detail="Email already registered")
 
     user = User(
         username=data.username,
@@ -198,12 +202,12 @@ def login(
     user = db.query(User).filter(User.username == form.username).first()
 
     if not user or not verify_password(form.password, user.password_hash):
-        raise HTTPException(401, "Invalid credentials")
+        raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    access_token = create_access_token({"sub": user.username})
+    token = create_access_token({"sub": user.username})
 
     return {
-        "access_token": access_token,
+        "access_token": token,
         "token_type": "bearer",
         "plan": user.plan
     }
@@ -212,6 +216,7 @@ def login(
 # =================================================
 # AI CHAT
 # =================================================
+
 @app.post("/ai/chat")
 async def ai_chat(
     message: str = Form(None),
@@ -221,10 +226,10 @@ async def ai_chat(
 ):
 
     if user.chat_used >= PLANS[user.plan]["chat"]:
-        raise HTTPException(403, "Chat limit reached")
+        raise HTTPException(status_code=403, detail="Chat limit reached")
 
     if not message and not image:
-        raise HTTPException(422, "Message or image required")
+        raise HTTPException(status_code=422, detail="Message or image required")
 
     messages = [
         {"role": "system", "content": "You are Acinyx.AI. Analyze images when provided."}
@@ -240,12 +245,17 @@ async def ai_chat(
                 {"type": "text", "text": message or "Analyze this image"},
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:{mime};base64,{encoded}"}
+                    "image_url": {
+                        "url": f"data:{mime};base64,{encoded}"
+                    }
                 }
             ]
         })
     else:
-        messages.append({"role": "user", "content": message})
+        messages.append({
+            "role": "user",
+            "content": message
+        })
 
     response = client.chat.completions.create(
         model="gpt-4.1-mini",
@@ -256,17 +266,20 @@ async def ai_chat(
     user.chat_used += 1
     db.commit()
 
-    return {"reply": response.choices[0].message.content}
+    return {
+        "reply": response.choices[0].message.content
+    }
 
 
 # =================================================
 # AI POSTER
 # =================================================
+
 SIZE_MAP = {
     "portrait": "1024x1536",
     "square": "1024x1024",
     "landscape": "1536x1024",
-    "instagram": "1080x1920",
+    "instagram": "1080x1920"
 }
 
 
@@ -282,7 +295,7 @@ async def ai_poster(
 ):
 
     if user.poster_used >= PLANS[user.plan]["poster"]:
-        raise HTTPException(403, "Poster limit reached")
+        raise HTTPException(status_code=403, detail="Poster limit reached")
 
     image_size = SIZE_MAP.get(size, "1024x1536")
 
@@ -293,13 +306,13 @@ Subject: {title}
 Description: {description}
 """
 
-    img = client.images.generate(
+    result = client.images.generate(
         model="gpt-image-1",
         prompt=prompt,
         size=image_size
     )
 
-    image_bytes = base64.b64decode(img.data[0].b64_json)
+    image_bytes = base64.b64decode(result.data[0].b64_json)
 
     filename = f"poster_{int(time.time())}.png"
     path = f"outputs/{filename}"
@@ -310,7 +323,11 @@ Description: {description}
     if PLANS[user.plan]["watermark"]:
         im = Image.open(path).convert("RGBA")
         draw = ImageDraw.Draw(im)
-        draw.text((20, im.height - 40), "Acinyx.AI", fill=(255, 255, 255, 160))
+        draw.text(
+            (20, im.height - 40),
+            "Acinyx.AI",
+            fill=(255, 255, 255, 160)
+        )
         im.save(path)
 
     user.poster_used += 1
@@ -322,6 +339,7 @@ Description: {description}
 # =================================================
 # RUN
 # =================================================
+
 if __name__ == "__main__":
     uvicorn.run(
         "backendapp:app",
