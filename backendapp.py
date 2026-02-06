@@ -28,6 +28,7 @@ import uvicorn
 # =================================================
 # ENV
 # =================================================
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY not set")
@@ -36,13 +37,16 @@ JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_SECRET")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_MINUTES = 60 * 24
 
-# IMPORTANT: do NOT pass proxies / custom http client
+# IMPORTANT:
+# Do NOT pass proxies or custom http clients.
+# Let OpenAI read the API key from environment.
 client = OpenAI()
 
 
 # =================================================
 # DATABASE
 # =================================================
+
 DATABASE_URL = "sqlite:///./acinyx.db"
 
 engine = create_engine(
@@ -50,7 +54,12 @@ engine = create_engine(
     connect_args={"check_same_thread": False}
 )
 
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+SessionLocal = sessionmaker(
+    bind=engine,
+    autoflush=False,
+    autocommit=False
+)
+
 Base = declarative_base()
 
 
@@ -66,14 +75,14 @@ class User(Base):
     poster_used = Column(Integer, default=0)
 
 
-# ✅ IMPORTANT
-# Only create tables – DO NOT DROP
+# ✅ DO NOT DROP TABLES
 Base.metadata.create_all(bind=engine)
 
 
 # =================================================
 # APP
 # =================================================
+
 app = FastAPI(title="Acinyx.AI Backend", version="3.9.0")
 
 app.add_middleware(
@@ -87,6 +96,7 @@ app.add_middleware(
 # =================================================
 # SECURITY
 # =================================================
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
@@ -110,6 +120,7 @@ def get_db():
 # =================================================
 # JWT helpers
 # =================================================
+
 def create_access_token(data: dict):
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(minutes=JWT_EXPIRE_MINUTES)
@@ -139,6 +150,7 @@ def get_current_user(
 # =================================================
 # PLANS
 # =================================================
+
 PLANS = {
     "free": {
         "chat": 5,
@@ -166,6 +178,7 @@ PLANS = {
 # =================================================
 # FILE SYSTEM
 # =================================================
+
 os.makedirs("outputs", exist_ok=True)
 app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
 
@@ -173,6 +186,7 @@ app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
 # =================================================
 # AUTH
 # =================================================
+
 class SignupBody(BaseModel):
     username: str
     email: str
@@ -223,6 +237,7 @@ def login(
 # =================================================
 # AI CHAT
 # =================================================
+
 @app.post("/ai/chat")
 async def ai_chat(
     message: str = Form(None),
@@ -238,7 +253,10 @@ async def ai_chat(
         raise HTTPException(422, "Message or image required")
 
     messages = [
-        {"role": "system", "content": "You are Acinyx.AI. Analyze images when provided."}
+        {
+            "role": "system",
+            "content": "You are Acinyx.AI. Analyze images when provided."
+        }
     ]
 
     if image:
@@ -251,7 +269,9 @@ async def ai_chat(
                 {"type": "text", "text": message or "Analyze this image"},
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:{mime};base64,{encoded}"}
+                    "image_url": {
+                        "url": f"data:{mime};base64,{encoded}"
+                    }
                 }
             ]
         })
@@ -273,6 +293,7 @@ async def ai_chat(
 # =================================================
 # AI POSTER
 # =================================================
+
 SIZE_MAP = {
     "portrait": "1024x1536",
     "square": "1024x1024",
@@ -331,8 +352,9 @@ Description: {description}
 
 
 # =================================================
-# RUN
+# RUN (local only)
 # =================================================
+
 if __name__ == "__main__":
     uvicorn.run(
         "backendapp:app",
