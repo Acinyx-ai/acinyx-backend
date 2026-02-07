@@ -18,11 +18,18 @@ from jose import jwt, JWTError
 import os
 import time
 import base64
+import logging
 
 from openai import OpenAI
 from PIL import Image, ImageDraw
 
 import uvicorn
+
+
+# =================================================
+# LOGGING
+# =================================================
+logging.basicConfig(level=logging.INFO)
 
 
 # =================================================
@@ -37,9 +44,7 @@ JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_SECRET")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_MINUTES = 60 * 24
 
-# IMPORTANT:
-# Do NOT pass proxies or custom http clients.
-# Let OpenAI read the API key from environment.
+# IMPORTANT: no custom httpx / proxies
 client = OpenAI()
 
 
@@ -75,7 +80,7 @@ class User(Base):
     poster_used = Column(Integer, default=0)
 
 
-# ✅ DO NOT DROP TABLES
+# ⚠️ only create – never drop
 Base.metadata.create_all(bind=engine)
 
 
@@ -83,7 +88,7 @@ Base.metadata.create_all(bind=engine)
 # APP
 # =================================================
 
-app = FastAPI(title="Acinyx.AI Backend", version="3.9.0")
+app = FastAPI(title="Acinyx.AI Backend", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -152,26 +157,10 @@ def get_current_user(
 # =================================================
 
 PLANS = {
-    "free": {
-        "chat": 5,
-        "poster": 2,
-        "watermark": True
-    },
-    "basic": {
-        "chat": 100,
-        "poster": 20,
-        "watermark": False
-    },
-    "pro": {
-        "chat": 500,
-        "poster": 100,
-        "watermark": False
-    },
-    "mega": {
-        "chat": 2000,
-        "poster": 300,
-        "watermark": False
-    },
+    "free": {"chat": 5, "poster": 2, "watermark": True},
+    "basic": {"chat": 100, "poster": 20, "watermark": False},
+    "pro": {"chat": 500, "poster": 100, "watermark": False},
+    "mega": {"chat": 2000, "poster": 300, "watermark": False},
 }
 
 
@@ -246,6 +235,11 @@ async def ai_chat(
     db: Session = Depends(get_db)
 ):
 
+    logging.info(f"Chat request from {user.username}")
+
+    if message and len(message) > 4000:
+        raise HTTPException(400, "Message too long")
+
     if user.chat_used >= PLANS[user.plan]["chat"]:
         raise HTTPException(403, "Chat limit reached")
 
@@ -253,10 +247,7 @@ async def ai_chat(
         raise HTTPException(422, "Message or image required")
 
     messages = [
-        {
-            "role": "system",
-            "content": "You are Acinyx.AI. Analyze images when provided."
-        }
+        {"role": "system", "content": "You are Acinyx.AI. Analyze images when provided."}
     ]
 
     if image:
@@ -269,9 +260,7 @@ async def ai_chat(
                 {"type": "text", "text": message or "Analyze this image"},
                 {
                     "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{mime};base64,{encoded}"
-                    }
+                    "image_url": {"url": f"data:{mime};base64,{encoded}"}
                 }
             ]
         })
@@ -312,6 +301,8 @@ async def ai_poster(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
+
+    logging.info(f"Poster request from {user.username}")
 
     if user.poster_used >= PLANS[user.plan]["poster"]:
         raise HTTPException(403, "Poster limit reached")
