@@ -44,7 +44,6 @@ JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_SECRET")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_MINUTES = 60 * 24
 
-# IMPORTANT: no custom httpx / proxies
 client = OpenAI()
 
 
@@ -204,7 +203,7 @@ def signup(data: SignupBody, db: Session = Depends(get_db)):
 
 
 # =================================================
-# LOGIN  (username OR email)
+# LOGIN (username OR email)
 # =================================================
 
 @app.post("/token")
@@ -256,7 +255,10 @@ async def ai_chat(
         raise HTTPException(422, "Message or image required")
 
     messages = [
-        {"role": "system", "content": "You are Acinyx.AI. Analyze images when provided."}
+        {
+            "role": "system",
+            "content": "You are Acinyx.AI. Analyze images when provided."
+        }
     ]
 
     if image:
@@ -269,7 +271,9 @@ async def ai_chat(
                 {"type": "text", "text": message or "Analyze this image"},
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:{mime};base64,{encoded}"}
+                    "image_url": {
+                        "url": f"data:{mime};base64,{encoded}"
+                    }
                 }
             ]
         })
