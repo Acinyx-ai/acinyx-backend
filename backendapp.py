@@ -7,7 +7,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 
-from sqlalchemy import Column, Integer, String, create_engine
+from sqlalchemy import Column, Integer, String, create_engine, or_
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 from passlib.context import CryptContext
@@ -80,7 +80,7 @@ class User(Base):
     poster_used = Column(Integer, default=0)
 
 
-# ⚠️ only create – never drop
+# only create – never drop
 Base.metadata.create_all(bind=engine)
 
 
@@ -88,7 +88,7 @@ Base.metadata.create_all(bind=engine)
 # APP
 # =================================================
 
-app = FastAPI(title="Acinyx.AI Backend", version="4.0.0")
+app = FastAPI(title="Acinyx.AI Backend", version="4.0.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -203,13 +203,22 @@ def signup(data: SignupBody, db: Session = Depends(get_db)):
     return {"message": "Account created"}
 
 
+# =================================================
+# LOGIN  (username OR email)
+# =================================================
+
 @app.post("/token")
 def login(
     form: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db)
 ):
 
-    user = db.query(User).filter(User.username == form.username).first()
+    user = db.query(User).filter(
+        or_(
+            User.username == form.username,
+            User.email == form.username
+        )
+    ).first()
 
     if not user or not verify_password(form.password, user.password_hash):
         raise HTTPException(401, "Invalid credentials")
