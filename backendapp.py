@@ -19,6 +19,7 @@ import os
 import time
 import base64
 import logging
+import requests   # ✅ added
 
 from openai import OpenAI
 from PIL import Image, ImageDraw
@@ -39,6 +40,8 @@ logging.basicConfig(level=logging.INFO)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY not set")
+
+PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")  # ✅ added
 
 JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_SECRET")
 JWT_ALGORITHM = "HS256"
@@ -79,7 +82,6 @@ class User(Base):
     poster_used = Column(Integer, default=0)
 
 
-# only create – never drop
 Base.metadata.create_all(bind=engine)
 
 
@@ -87,7 +89,7 @@ Base.metadata.create_all(bind=engine)
 # APP
 # =================================================
 
-app = FastAPI(title="Acinyx.AI Backend", version="4.0.1")
+app = FastAPI(title="Acinyx.AI Backend", version="4.0.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -232,6 +234,71 @@ def login(
 
 
 # =================================================
+# PAYSTACK – INIT PAYMENT   ✅ added
+# =================================================
+
+class PaystackInitBody(BaseModel):
+    plan: str
+
+
+PLAN_PRICES = {
+    "basic": 5,
+    "pro": 15,
+    "mega": 30,
+}
+
+
+@app.post("/payments/paystack/init")
+def init_paystack_payment(
+    body: PaystackInitBody,
+    user: User = Depends(get_current_user)
+):
+
+    if not PAYSTACK_SECRET_KEY:
+        raise HTTPException(500, "Paystack key not configured")
+
+    if body.plan not in PLAN_PRICES:
+        raise HTTPException(400, "Invalid plan")
+
+    amount_usd = PLAN_PRICES[body.plan]
+
+    # Paystack works in kobo
+    # (You can later convert currency properly if you want)
+    amount_kobo = int(amount_usd * 100 * 100)
+
+    headers = {
+        "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "email": user.email,
+        "amount": amount_kobo,
+        "metadata": {
+            "username": user.username,
+            "plan": body.plan
+        }
+    }
+
+    r = requests.post(
+        "https://api.paystack.co/transaction/initialize",
+        json=payload,
+        headers=headers,
+        timeout=30
+    )
+
+    data = r.json()
+
+    if not data.get("status"):
+        raise HTTPException(400, data.get("message", "Paystack error"))
+
+    return {
+        "authorization_url": data["data"]["authorization_url"],
+        "reference": data["data"]["reference"]
+    }
+
+
+# =================================================
 # AI CHAT
 # =================================================
 
@@ -356,7 +423,7 @@ Description: {description}
 
 
 # =================================================
-# RUN (local only)
+# RUN
 # =================================================
 
 if __name__ == "__main__":
