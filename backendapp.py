@@ -89,7 +89,7 @@ Base.metadata.create_all(bind=engine)
 # APP
 # =================================================
 
-app = FastAPI(title="Acinyx.AI Backend", version="4.0.2")
+app = FastAPI(title="Acinyx.AI Backend", version="4.0.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -262,7 +262,6 @@ def init_paystack_payment(
 
     amount_usd = PLAN_PRICES[body.plan]
 
-    # Paystack expects lowest unit (kobo)
     amount_kobo = int(amount_usd * 100 * 100)
 
     headers = {
@@ -298,7 +297,7 @@ def init_paystack_payment(
 
 
 # =================================================
-# AI CHAT
+# AI CHAT  (now includes current time)
 # =================================================
 
 @app.post("/ai/chat")
@@ -320,10 +319,12 @@ async def ai_chat(
     if not message and not image:
         raise HTTPException(422, "Message or image required")
 
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
     messages = [
         {
             "role": "system",
-            "content": "You are Acinyx.AI. Analyze images when provided."
+            "content": f"You are Acinyx.AI. The current date and time is {now}. Analyze images when provided."
         }
     ]
 
@@ -359,7 +360,7 @@ async def ai_chat(
 
 
 # =================================================
-# AI POSTER
+# AI POSTER  (strict & specific prompt)
 # =================================================
 
 SIZE_MAP = {
@@ -389,10 +390,31 @@ async def ai_poster(
     image_size = SIZE_MAP.get(size, "1024x1536")
 
     prompt = f"""
-Create a {style} poster.
-Cinematic lighting, professional quality.
-Subject: {title}
-Description: {description}
+You are a professional graphic designer.
+
+Create a single high-quality poster image with the following strict rules.
+
+Main subject:
+{title}
+
+Text or message to communicate:
+{description}
+
+Visual style:
+{style}
+
+Layout rules:
+- One main subject only
+- Clean background
+- Centered composition
+- High contrast lighting
+- Print-ready quality
+- No extra people unless explicitly requested
+- No logos
+- No watermarks
+- No borders
+- No random text
+- No UI elements
 """
 
     img = client.images.generate(
