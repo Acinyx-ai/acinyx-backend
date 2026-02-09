@@ -19,7 +19,7 @@ import os
 import time
 import base64
 import logging
-import requests   # ✅ added
+import requests
 
 from openai import OpenAI
 from PIL import Image, ImageDraw
@@ -41,7 +41,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY not set")
 
-PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")  # ✅ added
+PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
 
 JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_SECRET")
 JWT_ALGORITHM = "HS256"
@@ -234,7 +234,7 @@ def login(
 
 
 # =================================================
-# PAYSTACK – INIT PAYMENT   ✅ added
+# PAYSTACK – INIT PAYMENT
 # =================================================
 
 class PaystackInitBody(BaseModel):
@@ -262,8 +262,7 @@ def init_paystack_payment(
 
     amount_usd = PLAN_PRICES[body.plan]
 
-    # Paystack works in kobo
-    # (You can later convert currency properly if you want)
+    # Paystack expects lowest unit (kobo)
     amount_kobo = int(amount_usd * 100 * 100)
 
     headers = {
