@@ -36,8 +36,8 @@ if not OPENAI_API_KEY:
 
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
 
-# ✅ NEW
-BING_NEWS_API_KEY = os.getenv("BING_NEWS_API_KEY")
+# ✅ NewsAPI
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 
 JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_SECRET")
 JWT_ALGORITHM = "HS256"
@@ -283,42 +283,40 @@ def get_chat_messages(
 
 
 # -------------------------------------------------
-# ✅ NEW : Bing News helper
+# ✅ NewsAPI helper
 # -------------------------------------------------
 
-def fetch_bing_news(query: str, limit: int = 5) -> str:
-    if not BING_NEWS_API_KEY:
+def fetch_newsapi_news(query: str, limit: int = 5) -> str:
+    if not NEWS_API_KEY:
         return ""
 
     try:
         r = requests.get(
-            "https://api.bing.microsoft.com/v7.0/news/search",
-            headers={
-                "Ocp-Apim-Subscription-Key": BING_NEWS_API_KEY
-            },
+            "https://newsapi.org/v2/everything",
             params={
                 "q": query,
-                "mkt": "en-US",
-                "count": limit,
-                "sortBy": "Date"
+                "language": "en",
+                "pageSize": limit,
+                "sortBy": "publishedAt",
+                "apiKey": NEWS_API_KEY
             },
             timeout=10
         )
 
         data = r.json()
-        items = data.get("value", [])
+        items = data.get("articles", [])
 
         lines = []
         for n in items:
-            title = n.get("name")
-            source = n.get("provider", [{}])[0].get("name", "")
-            date = n.get("datePublished", "")
+            title = n.get("title")
+            source = (n.get("source") or {}).get("name", "")
+            date = n.get("publishedAt", "")
             lines.append(f"- {title} ({source}, {date})")
 
         return "\n".join(lines)
 
     except Exception as e:
-        logging.warning("Bing news failed: %s", e)
+        logging.warning("NewsAPI failed: %s", e)
         return ""
 
 
@@ -358,10 +356,10 @@ async def ai_chat(
 
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
-    # ✅ NEW: live news context
+    # ✅ live news context
     news_context = ""
     if message:
-        news_context = fetch_bing_news(message)
+        news_context = fetch_newsapi_news(message)
 
     system_prompt = f"You are Acinyx.AI. The current date and time is {now}. Analyze images when provided."
 
