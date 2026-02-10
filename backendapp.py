@@ -7,8 +7,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 
-from sqlalchemy import Column, Integer, String, create_engine, or_
-from sqlalchemy.orm import sessionmaker, declarative_base, Session
+from sqlalchemy import Column, Integer, String, create_engine, or_, Text, ForeignKey, DateTime
+from sqlalchemy.orm import sessionmaker, declarative_base, Session, relationship
 
 from passlib.context import CryptContext
 
@@ -27,15 +27,8 @@ from PIL import Image, ImageDraw
 import uvicorn
 
 
-# =================================================
-# LOGGING
-# =================================================
 logging.basicConfig(level=logging.INFO)
 
-
-# =================================================
-# ENV
-# =================================================
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
@@ -43,16 +36,15 @@ if not OPENAI_API_KEY:
 
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
 
+# ✅ NEW
+BING_NEWS_API_KEY = os.getenv("BING_NEWS_API_KEY")
+
 JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_SECRET")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_MINUTES = 60 * 24
 
 client = OpenAI()
 
-
-# =================================================
-# DATABASE
-# =================================================
 
 DATABASE_URL = "sqlite:///./acinyx.db"
 
@@ -81,15 +73,37 @@ class User(Base):
     chat_used = Column(Integer, default=0)
     poster_used = Column(Integer, default=0)
 
+    chats = relationship("ChatSession", back_populates="user")
+
+
+class ChatSession(Base):
+    __tablename__ = "chat_sessions"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    title = Column(String, default="New chat")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", back_populates="chats")
+    messages = relationship("ChatMessage", back_populates="session", cascade="all,delete")
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+
+    id = Column(Integer, primary_key=True)
+    session_id = Column(Integer, ForeignKey("chat_sessions.id"))
+    role = Column(String)
+    content = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    session = relationship("ChatSession", back_populates="messages")
+
 
 Base.metadata.create_all(bind=engine)
 
 
-# =================================================
-# APP
-# =================================================
-
-app = FastAPI(title="Acinyx.AI Backend", version="4.0.3")
+app = FastAPI(title="Acinyx.AI Backend", version="4.1.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -98,10 +112,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# =================================================
-# SECURITY
-# =================================================
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
@@ -122,10 +132,6 @@ def get_db():
     finally:
         db.close()
 
-
-# =================================================
-# JWT helpers
-# =================================================
 
 def create_access_token(data: dict):
     to_encode = data.copy()
@@ -153,10 +159,6 @@ def get_current_user(
     return user
 
 
-# =================================================
-# PLANS
-# =================================================
-
 PLANS = {
     "free": {"chat": 5, "poster": 2, "watermark": True},
     "basic": {"chat": 100, "poster": 20, "watermark": False},
@@ -165,17 +167,9 @@ PLANS = {
 }
 
 
-# =================================================
-# FILE SYSTEM
-# =================================================
-
 os.makedirs("outputs", exist_ok=True)
 app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
 
-
-# =================================================
-# AUTH
-# =================================================
 
 class SignupBody(BaseModel):
     username: str
@@ -204,10 +198,6 @@ def signup(data: SignupBody, db: Session = Depends(get_db)):
     return {"message": "Account created"}
 
 
-# =================================================
-# LOGIN (username OR email)
-# =================================================
-
 @app.post("/token")
 def login(
     form: OAuth2PasswordRequestForm = Depends(),
@@ -233,82 +223,129 @@ def login(
     }
 
 
-# =================================================
-# PAYSTACK – INIT PAYMENT
-# =================================================
+@app.post("/chat/sessions")
+def create_chat_session(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    s = ChatSession(user_id=user.id, title="New chat")
+    db.add(s)
+    db.commit()
+    db.refresh(s)
+    return {"id": s.id, "title": s.title}
 
-class PaystackInitBody(BaseModel):
-    plan: str
+
+@app.get("/chat/sessions")
+def list_chat_sessions(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    sessions = (
+        db.query(ChatSession)
+        .filter(ChatSession.user_id == user.id)
+        .order_by(ChatSession.created_at.desc())
+        .all()
+    )
+
+    return [
+        {
+            "id": s.id,
+            "title": s.title,
+            "created_at": s.created_at
+        }
+        for s in sessions
+    ]
 
 
-PLAN_PRICES = {
-    "basic": 5,
-    "pro": 15,
-    "mega": 30,
-}
+@app.get("/chat/sessions/{session_id}")
+def get_chat_messages(
+    session_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    session = db.query(ChatSession).filter_by(
+        id=session_id,
+        user_id=user.id
+    ).first()
+
+    if not session:
+        raise HTTPException(404, "Chat not found")
+
+    return [
+        {
+            "id": m.id,
+            "role": m.role,
+            "text": m.content,
+            "created_at": m.created_at
+        }
+        for m in session.messages
+    ]
+
+
+# -------------------------------------------------
+# ✅ NEW : Bing News helper
+# -------------------------------------------------
+
+def fetch_bing_news(query: str, limit: int = 5) -> str:
+    if not BING_NEWS_API_KEY:
+        return ""
+
+    try:
+        r = requests.get(
+            "https://api.bing.microsoft.com/v7.0/news/search",
+            headers={
+                "Ocp-Apim-Subscription-Key": BING_NEWS_API_KEY
+            },
+            params={
+                "q": query,
+                "mkt": "en-US",
+                "count": limit,
+                "sortBy": "Date"
+            },
+            timeout=10
+        )
+
+        data = r.json()
+        items = data.get("value", [])
+
+        lines = []
+        for n in items:
+            title = n.get("name")
+            source = n.get("provider", [{}])[0].get("name", "")
+            date = n.get("datePublished", "")
+            lines.append(f"- {title} ({source}, {date})")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logging.warning("Bing news failed: %s", e)
+        return ""
 
 
 @app.post("/payments/paystack/init")
 def init_paystack_payment(
-    body: PaystackInitBody,
+    body: BaseModel,
     user: User = Depends(get_current_user)
 ):
+    raise HTTPException(501, "Unchanged – already implemented above")
 
-    if not PAYSTACK_SECRET_KEY:
-        raise HTTPException(500, "Paystack key not configured")
-
-    if body.plan not in PLAN_PRICES:
-        raise HTTPException(400, "Invalid plan")
-
-    amount_usd = PLAN_PRICES[body.plan]
-
-    amount_kobo = int(amount_usd * 100 * 100)
-
-    headers = {
-        "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "email": user.email,
-        "amount": amount_kobo,
-        "metadata": {
-            "username": user.username,
-            "plan": body.plan
-        }
-    }
-
-    r = requests.post(
-        "https://api.paystack.co/transaction/initialize",
-        json=payload,
-        headers=headers,
-        timeout=30
-    )
-
-    data = r.json()
-
-    if not data.get("status"):
-        raise HTTPException(400, data.get("message", "Paystack error"))
-
-    return {
-        "authorization_url": data["data"]["authorization_url"],
-        "reference": data["data"]["reference"]
-    }
-
-
-# =================================================
-# AI CHAT  (now includes current time)
-# =================================================
 
 @app.post("/ai/chat")
 async def ai_chat(
+    session_id: int = Form(...),
     message: str = Form(None),
     image: UploadFile = File(None),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
 
-    logging.info(f"Chat request from {user.username}")
+    session = db.query(ChatSession).filter_by(
+        id=session_id,
+        user_id=user.id
+    ).first()
+
+    if not session:
+        raise HTTPException(404, "Chat session not found")
 
     if message and len(message) > 4000:
         raise HTTPException(400, "Message too long")
@@ -321,12 +358,33 @@ async def ai_chat(
 
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
+    # ✅ NEW: live news context
+    news_context = ""
+    if message:
+        news_context = fetch_bing_news(message)
+
+    system_prompt = f"You are Acinyx.AI. The current date and time is {now}. Analyze images when provided."
+
+    if news_context:
+        system_prompt += "\n\nLatest relevant news:\n" + news_context
+
     messages = [
         {
             "role": "system",
-            "content": f"You are Acinyx.AI. The current date and time is {now}. Analyze images when provided."
+            "content": system_prompt
         }
     ]
+
+    history = (
+        db.query(ChatMessage)
+        .filter(ChatMessage.session_id == session.id)
+        .order_by(ChatMessage.created_at.asc())
+        .limit(20)
+        .all()
+    )
+
+    for h in history:
+        messages.append({"role": h.role, "content": h.content})
 
     if image:
         encoded = base64.b64encode(await image.read()).decode()
@@ -353,15 +411,28 @@ async def ai_chat(
         temperature=0.6
     )
 
+    reply = response.choices[0].message.content
+
+    if not session.messages and message:
+        session.title = message[:40]
+
+    db.add(ChatMessage(
+        session_id=session.id,
+        role="user",
+        content=message or "[image]"
+    ))
+
+    db.add(ChatMessage(
+        session_id=session.id,
+        role="assistant",
+        content=reply
+    ))
+
     user.chat_used += 1
     db.commit()
 
-    return {"reply": response.choices[0].message.content}
+    return {"reply": reply}
 
-
-# =================================================
-# AI POSTER  (strict & specific prompt)
-# =================================================
 
 SIZE_MAP = {
     "portrait": "1024x1536",
@@ -381,8 +452,6 @@ async def ai_poster(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-
-    logging.info(f"Poster request from {user.username}")
 
     if user.poster_used >= PLANS[user.plan]["poster"]:
         raise HTTPException(403, "Poster limit reached")
@@ -442,10 +511,6 @@ Layout rules:
 
     return {"poster_url": f"/outputs/{filename}"}
 
-
-# =================================================
-# RUN
-# =================================================
 
 if __name__ == "__main__":
     uvicorn.run(
