@@ -8,7 +8,7 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 
 from sqlalchemy import Column, Integer, String, create_engine, or_, Text, ForeignKey, DateTime
-from sqlalchemy.orm import sessionmaker, declarative_base, Session, relationship
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 from passlib.context import CryptContext
 
@@ -74,7 +74,6 @@ class User(Base):
     poster_used = Column(Integer, default=0)
 
 
-# (kept — but no longer used by chat flow)
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
 
@@ -84,7 +83,6 @@ class ChatSession(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
-# (kept — but no longer used by chat flow)
 class ChatMessage(Base):
     __tablename__ = "chat_messages"
 
@@ -219,7 +217,7 @@ def login(
 
 
 # -------------------------------------------------
-# ✅ NewsAPI helper
+# NewsAPI helper
 # -------------------------------------------------
 
 def fetch_newsapi_news(query: str, limit: int = 5) -> str:
@@ -256,16 +254,62 @@ def fetch_newsapi_news(query: str, limit: int = 5) -> str:
         return ""
 
 
+# -------------------------------------------------
+# Paystack
+# -------------------------------------------------
+
+class PaystackInitBody(BaseModel):
+    amount: int      # amount in the smallest currency unit
+    plan: str | None = None
+
+
 @app.post("/payments/paystack/init")
 def init_paystack_payment(
-    body: BaseModel,
+    body: PaystackInitBody,
     user: User = Depends(get_current_user)
 ):
-    raise HTTPException(501, "Unchanged – already implemented above")
+
+    if not PAYSTACK_SECRET_KEY:
+        raise HTTPException(500, "PAYSTACK_SECRET_KEY not set")
+
+    payload = {
+        "email": user.email,
+        "amount": body.amount,
+        "metadata": {
+            "username": user.username,
+            "plan": body.plan
+        }
+    }
+
+    try:
+        r = requests.post(
+            "https://api.paystack.co/transaction/initialize",
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+                "Content-Type": "application/json"
+            },
+            timeout=15
+        )
+
+        data = r.json()
+
+        if not data.get("status"):
+            logging.error("Paystack init failed: %s", data)
+            raise HTTPException(400, data.get("message", "Paystack error"))
+
+        return {
+            "authorization_url": data["data"]["authorization_url"],
+            "reference": data["data"]["reference"]
+        }
+
+    except requests.RequestException as e:
+        logging.error("Paystack connection error: %s", e)
+        raise HTTPException(500, "Unable to connect to Paystack")
 
 
 # -------------------------------------------------
-# ✅ Chat endpoint – NO sessions
+# Chat endpoint – NO sessions
 # -------------------------------------------------
 
 @app.post("/ai/chat")
