@@ -73,9 +73,8 @@ class User(Base):
     chat_used = Column(Integer, default=0)
     poster_used = Column(Integer, default=0)
 
-    chats = relationship("ChatSession", back_populates="user")
 
-
+# (kept — but no longer used by chat flow)
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
 
@@ -84,10 +83,8 @@ class ChatSession(Base):
     title = Column(String, default="New chat")
     created_at = Column(DateTime, default=datetime.utcnow)
 
-    user = relationship("User", back_populates="chats")
-    messages = relationship("ChatMessage", back_populates="session", cascade="all,delete")
 
-
+# (kept — but no longer used by chat flow)
 class ChatMessage(Base):
     __tablename__ = "chat_messages"
 
@@ -96,8 +93,6 @@ class ChatMessage(Base):
     role = Column(String)
     content = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
-
-    session = relationship("ChatSession", back_populates="messages")
 
 
 Base.metadata.create_all(bind=engine)
@@ -223,65 +218,6 @@ def login(
     }
 
 
-@app.post("/chat/sessions")
-def create_chat_session(
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    s = ChatSession(user_id=user.id, title="New chat")
-    db.add(s)
-    db.commit()
-    db.refresh(s)
-    return {"id": s.id, "title": s.title}
-
-
-@app.get("/chat/sessions")
-def list_chat_sessions(
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    sessions = (
-        db.query(ChatSession)
-        .filter(ChatSession.user_id == user.id)
-        .order_by(ChatSession.created_at.desc())
-        .all()
-    )
-
-    return [
-        {
-            "id": s.id,
-            "title": s.title,
-            "created_at": s.created_at
-        }
-        for s in sessions
-    ]
-
-
-@app.get("/chat/sessions/{session_id}")
-def get_chat_messages(
-    session_id: int,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    session = db.query(ChatSession).filter_by(
-        id=session_id,
-        user_id=user.id
-    ).first()
-
-    if not session:
-        raise HTTPException(404, "Chat not found")
-
-    return [
-        {
-            "id": m.id,
-            "role": m.role,
-            "text": m.content,
-            "created_at": m.created_at
-        }
-        for m in session.messages
-    ]
-
-
 # -------------------------------------------------
 # ✅ NewsAPI helper
 # -------------------------------------------------
@@ -328,22 +264,17 @@ def init_paystack_payment(
     raise HTTPException(501, "Unchanged – already implemented above")
 
 
+# -------------------------------------------------
+# ✅ Chat endpoint – NO sessions
+# -------------------------------------------------
+
 @app.post("/ai/chat")
 async def ai_chat(
-    session_id: int = Form(...),
     message: str = Form(None),
     image: UploadFile = File(None),
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-
-    session = db.query(ChatSession).filter_by(
-        id=session_id,
-        user_id=user.id
-    ).first()
-
-    if not session:
-        raise HTTPException(404, "Chat session not found")
 
     if message and len(message) > 4000:
         raise HTTPException(400, "Message too long")
@@ -356,7 +287,6 @@ async def ai_chat(
 
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
-    # ✅ live news context
     news_context = ""
     if message:
         news_context = fetch_newsapi_news(message)
@@ -372,17 +302,6 @@ async def ai_chat(
             "content": system_prompt
         }
     ]
-
-    history = (
-        db.query(ChatMessage)
-        .filter(ChatMessage.session_id == session.id)
-        .order_by(ChatMessage.created_at.asc())
-        .limit(20)
-        .all()
-    )
-
-    for h in history:
-        messages.append({"role": h.role, "content": h.content})
 
     if image:
         encoded = base64.b64encode(await image.read()).decode()
@@ -410,21 +329,6 @@ async def ai_chat(
     )
 
     reply = response.choices[0].message.content
-
-    if not session.messages and message:
-        session.title = message[:40]
-
-    db.add(ChatMessage(
-        session_id=session.id,
-        role="user",
-        content=message or "[image]"
-    ))
-
-    db.add(ChatMessage(
-        session_id=session.id,
-        role="assistant",
-        content=reply
-    ))
 
     user.chat_used += 1
     db.commit()
