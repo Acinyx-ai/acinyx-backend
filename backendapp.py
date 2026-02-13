@@ -81,7 +81,7 @@ class ChatMemory(Base):
 
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), index=True)
-    role = Column(String)
+    role = Column(String)   # user | assistant
     content = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -249,7 +249,8 @@ def fetch_newsapi_news(query: str, limit: int = 5) -> str:
 
 
 # -------------------------------------------------
-# Paystack init (KES sent directly)
+# Paystack init
+# (amount must already be in the smallest unit)
 # -------------------------------------------------
 
 class PaystackInitBody(BaseModel):
@@ -350,7 +351,7 @@ async def paystack_webhook(request: Request, db: Session = Depends(get_db)):
 
 
 # -------------------------------------------------
-# Chat with memory
+# Chat with memory (no sessions)
 # -------------------------------------------------
 
 MAX_HISTORY = 12
@@ -405,8 +406,12 @@ async def ai_chat(
             "role": "user",
             "content": [
                 {"type": "text", "text": message or "Analyze this image"},
-                {"type": "image_url",
-                 "image_url": {"url": f"data:{mime};base64,{encoded}"}}
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime};base64,{encoded}"
+                    }
+                }
             ]
         })
 
