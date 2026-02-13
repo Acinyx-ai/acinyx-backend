@@ -36,7 +36,6 @@ if not OPENAI_API_KEY:
 
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
 
-# ✅ NewsAPI
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 
 JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_SECRET")
@@ -62,6 +61,10 @@ SessionLocal = sessionmaker(
 Base = declarative_base()
 
 
+# -------------------------------------------------
+# Models
+# -------------------------------------------------
+
 class User(Base):
     __tablename__ = "users"
 
@@ -74,21 +77,13 @@ class User(Base):
     poster_used = Column(Integer, default=0)
 
 
-class ChatSession(Base):
-    __tablename__ = "chat_sessions"
+# ✅ simple per-user memory (NO sessions)
+class ChatMemory(Base):
+    __tablename__ = "chat_memory"
 
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
-    title = Column(String, default="New chat")
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-
-class ChatMessage(Base):
-    __tablename__ = "chat_messages"
-
-    id = Column(Integer, primary_key=True)
-    session_id = Column(Integer, ForeignKey("chat_sessions.id"))
-    role = Column(String)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    role = Column(String)      # user | assistant
     content = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -96,7 +91,9 @@ class ChatMessage(Base):
 Base.metadata.create_all(bind=engine)
 
 
-app = FastAPI(title="Acinyx.AI Backend", version="4.1.1")
+# -------------------------------------------------
+
+app = FastAPI(title="Acinyx.AI Backend", version="4.2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -163,6 +160,10 @@ PLANS = {
 os.makedirs("outputs", exist_ok=True)
 app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
 
+
+# -------------------------------------------------
+# Auth
+# -------------------------------------------------
 
 class SignupBody(BaseModel):
     username: str
@@ -259,7 +260,7 @@ def fetch_newsapi_news(query: str, limit: int = 5) -> str:
 # -------------------------------------------------
 
 class PaystackInitBody(BaseModel):
-    amount: int      # amount in the smallest currency unit
+    amount: int
     plan: str | None = None
 
 
@@ -295,7 +296,6 @@ def init_paystack_payment(
         data = r.json()
 
         if not data.get("status"):
-            logging.error("Paystack init failed: %s", data)
             raise HTTPException(400, data.get("message", "Paystack error"))
 
         return {
@@ -303,14 +303,16 @@ def init_paystack_payment(
             "reference": data["data"]["reference"]
         }
 
-    except requests.RequestException as e:
-        logging.error("Paystack connection error: %s", e)
+    except requests.RequestException:
         raise HTTPException(500, "Unable to connect to Paystack")
 
 
 # -------------------------------------------------
-# Chat endpoint – NO sessions
+# Chat endpoint – WITH MEMORY (no sessions)
 # -------------------------------------------------
+
+MAX_HISTORY = 12
+
 
 @app.post("/ai/chat")
 async def ai_chat(
@@ -329,24 +331,46 @@ async def ai_chat(
     if not message and not image:
         raise HTTPException(422, "Message or image required")
 
+    # ---------------------------------------------
+    # load last messages for this user
+    # ---------------------------------------------
+    history_rows = (
+        db.query(ChatMemory)
+        .filter(ChatMemory.user_id == user.id)
+        .order_by(ChatMemory.created_at.desc())
+        .limit(MAX_HISTORY)
+        .all()
+    )
+
+    history_rows.reverse()
+
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
     news_context = ""
     if message:
         news_context = fetch_newsapi_news(message)
 
-    system_prompt = f"You are Acinyx.AI. The current date and time is {now}. Analyze images when provided."
+    system_prompt = (
+        f"You are Acinyx.AI. The current date and time is {now}. "
+        "Analyze images when provided."
+    )
 
     if news_context:
         system_prompt += "\n\nLatest relevant news:\n" + news_context
 
     messages = [
-        {
-            "role": "system",
-            "content": system_prompt
-        }
+        {"role": "system", "content": system_prompt}
     ]
 
+    for h in history_rows:
+        messages.append({
+            "role": h.role,
+            "content": h.content
+        })
+
+    # ---------------------------------------------
+    # add current user message
+    # ---------------------------------------------
     if image:
         encoded = base64.b64encode(await image.read()).decode()
         mime = image.content_type or "image/png"
@@ -363,9 +387,28 @@ async def ai_chat(
                 }
             ]
         })
-    else:
-        messages.append({"role": "user", "content": message})
 
+        db.add(ChatMemory(
+            user_id=user.id,
+            role="user",
+            content=message or "[image]"
+        ))
+
+    else:
+        messages.append({
+            "role": "user",
+            "content": message
+        })
+
+        db.add(ChatMemory(
+            user_id=user.id,
+            role="user",
+            content=message
+        ))
+
+    # ---------------------------------------------
+    # OpenAI
+    # ---------------------------------------------
     response = client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=messages,
@@ -374,11 +417,24 @@ async def ai_chat(
 
     reply = response.choices[0].message.content
 
+    # ---------------------------------------------
+    # store assistant reply
+    # ---------------------------------------------
+    db.add(ChatMemory(
+        user_id=user.id,
+        role="assistant",
+        content=reply
+    ))
+
     user.chat_used += 1
     db.commit()
 
     return {"reply": reply}
 
+
+# -------------------------------------------------
+# Poster
+# -------------------------------------------------
 
 SIZE_MAP = {
     "portrait": "1024x1536",
