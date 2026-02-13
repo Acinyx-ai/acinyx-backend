@@ -1,6 +1,6 @@
 from fastapi import (
     FastAPI, HTTPException, Depends,
-    UploadFile, File, Form
+    UploadFile, File, Form, Request
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -20,6 +20,8 @@ import time
 import base64
 import logging
 import requests
+import hmac
+import hashlib
 
 from openai import OpenAI
 from PIL import Image, ImageDraw
@@ -29,13 +31,11 @@ import uvicorn
 
 logging.basicConfig(level=logging.INFO)
 
-
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY not set")
 
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
-
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 
 JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_SECRET")
@@ -43,7 +43,6 @@ JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_MINUTES = 60 * 24
 
 client = OpenAI()
-
 
 DATABASE_URL = "sqlite:///./acinyx.db"
 
@@ -77,13 +76,12 @@ class User(Base):
     poster_used = Column(Integer, default=0)
 
 
-# ✅ simple per-user memory (NO sessions)
 class ChatMemory(Base):
     __tablename__ = "chat_memory"
 
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), index=True)
-    role = Column(String)      # user | assistant
+    role = Column(String)
     content = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -91,9 +89,7 @@ class ChatMemory(Base):
 Base.metadata.create_all(bind=engine)
 
 
-# -------------------------------------------------
-
-app = FastAPI(title="Acinyx.AI Backend", version="4.2.1")
+app = FastAPI(title="Acinyx.AI Backend", version="4.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -101,7 +97,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
@@ -155,7 +150,6 @@ PLANS = {
     "pro": {"chat": 500, "poster": 100, "watermark": False},
     "mega": {"chat": 2000, "poster": 300, "watermark": False},
 }
-
 
 os.makedirs("outputs", exist_ok=True)
 app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
@@ -218,7 +212,7 @@ def login(
 
 
 # -------------------------------------------------
-# NewsAPI helper
+# News helper
 # -------------------------------------------------
 
 def fetch_newsapi_news(query: str, limit: int = 5) -> str:
@@ -250,13 +244,12 @@ def fetch_newsapi_news(query: str, limit: int = 5) -> str:
 
         return "\n".join(lines)
 
-    except Exception as e:
-        logging.warning("NewsAPI failed: %s", e)
+    except Exception:
         return ""
 
 
 # -------------------------------------------------
-# Paystack
+# Paystack init (KES sent directly)
 # -------------------------------------------------
 
 class PaystackInitBody(BaseModel):
@@ -282,33 +275,82 @@ def init_paystack_payment(
         }
     }
 
-    try:
-        r = requests.post(
-            "https://api.paystack.co/transaction/initialize",
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
-                "Content-Type": "application/json"
-            },
-            timeout=15
-        )
+    r = requests.post(
+        "https://api.paystack.co/transaction/initialize",
+        json=payload,
+        headers={
+            "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+            "Content-Type": "application/json"
+        },
+        timeout=15
+    )
 
-        data = r.json()
+    data = r.json()
 
-        if not data.get("status"):
-            raise HTTPException(400, data.get("message", "Paystack error"))
+    if not data.get("status"):
+        raise HTTPException(400, data.get("message", "Paystack error"))
 
-        return {
-            "authorization_url": data["data"]["authorization_url"],
-            "reference": data["data"]["reference"]
-        }
-
-    except requests.RequestException:
-        raise HTTPException(500, "Unable to connect to Paystack")
+    return {
+        "authorization_url": data["data"]["authorization_url"],
+        "reference": data["data"]["reference"]
+    }
 
 
 # -------------------------------------------------
-# Chat endpoint – WITH MEMORY (no sessions)
+# Paystack webhook
+# -------------------------------------------------
+
+@app.post("/payments/paystack/webhook")
+async def paystack_webhook(request: Request, db: Session = Depends(get_db)):
+
+    raw_body = await request.body()
+    signature = request.headers.get("x-paystack-signature")
+
+    if not signature:
+        raise HTTPException(400, "Missing signature")
+
+    expected = hmac.new(
+        PAYSTACK_SECRET_KEY.encode(),
+        raw_body,
+        hashlib.sha512
+    ).hexdigest()
+
+    if not hmac.compare_digest(expected, signature):
+        raise HTTPException(400, "Invalid signature")
+
+    payload = await request.json()
+
+    if payload.get("event") != "charge.success":
+        return {"status": "ignored"}
+
+    data = payload.get("data", {})
+    metadata = data.get("metadata", {})
+
+    username = metadata.get("username")
+    plan = metadata.get("plan")
+
+    if not username or not plan:
+        return {"status": "missing metadata"}
+
+    user = db.query(User).filter(User.username == username).first()
+
+    if not user:
+        return {"status": "user not found"}
+
+    if plan not in PLANS:
+        return {"status": "invalid plan"}
+
+    user.plan = plan
+    user.chat_used = 0
+    user.poster_used = 0
+
+    db.commit()
+
+    return {"status": "ok"}
+
+
+# -------------------------------------------------
+# Chat with memory
 # -------------------------------------------------
 
 MAX_HISTORY = 12
@@ -331,10 +373,7 @@ async def ai_chat(
     if not message and not image:
         raise HTTPException(422, "Message or image required")
 
-    # ---------------------------------------------
-    # load last messages for this user
-    # ---------------------------------------------
-    history_rows = (
+    history = (
         db.query(ChatMemory)
         .filter(ChatMemory.user_id == user.id)
         .order_by(ChatMemory.created_at.desc())
@@ -342,35 +381,22 @@ async def ai_chat(
         .all()
     )
 
-    history_rows.reverse()
+    history.reverse()
 
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
-    news_context = ""
-    if message:
-        news_context = fetch_newsapi_news(message)
+    news_context = fetch_newsapi_news(message) if message else ""
 
-    system_prompt = (
-        f"You are Acinyx.AI. The current date and time is {now}. "
-        "Analyze images when provided."
-    )
+    system_prompt = f"You are Acinyx.AI. The current date and time is {now}."
 
     if news_context:
         system_prompt += "\n\nLatest relevant news:\n" + news_context
 
-    messages = [
-        {"role": "system", "content": system_prompt}
-    ]
+    messages = [{"role": "system", "content": system_prompt}]
 
-    for h in history_rows:
-        messages.append({
-            "role": h.role,
-            "content": h.content
-        })
+    for h in history:
+        messages.append({"role": h.role, "content": h.content})
 
-    # ---------------------------------------------
-    # add current user message
-    # ---------------------------------------------
     if image:
         encoded = base64.b64encode(await image.read()).decode()
         mime = image.content_type or "image/png"
@@ -379,12 +405,8 @@ async def ai_chat(
             "role": "user",
             "content": [
                 {"type": "text", "text": message or "Analyze this image"},
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{mime};base64,{encoded}"
-                    }
-                }
+                {"type": "image_url",
+                 "image_url": {"url": f"data:{mime};base64,{encoded}"}}
             ]
         })
 
@@ -395,10 +417,7 @@ async def ai_chat(
         ))
 
     else:
-        messages.append({
-            "role": "user",
-            "content": message
-        })
+        messages.append({"role": "user", "content": message})
 
         db.add(ChatMemory(
             user_id=user.id,
@@ -406,9 +425,6 @@ async def ai_chat(
             content=message
         ))
 
-    # ---------------------------------------------
-    # OpenAI
-    # ---------------------------------------------
     response = client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=messages,
@@ -417,9 +433,6 @@ async def ai_chat(
 
     reply = response.choices[0].message.content
 
-    # ---------------------------------------------
-    # store assistant reply
-    # ---------------------------------------------
     db.add(ChatMemory(
         user_id=user.id,
         role="assistant",
@@ -461,31 +474,11 @@ async def ai_poster(
     image_size = SIZE_MAP.get(size, "1024x1536")
 
     prompt = f"""
-You are a professional graphic designer.
+Create a professional poster.
 
-Create a single high-quality poster image with the following strict rules.
-
-Main subject:
-{title}
-
-Text or message to communicate:
-{description}
-
-Visual style:
-{style}
-
-Layout rules:
-- One main subject only
-- Clean background
-- Centered composition
-- High contrast lighting
-- Print-ready quality
-- No extra people unless explicitly requested
-- No logos
-- No watermarks
-- No borders
-- No random text
-- No UI elements
+Subject: {title}
+Message: {description}
+Style: {style}
 """
 
     img = client.images.generate(
