@@ -98,7 +98,7 @@ Base.metadata.create_all(bind=engine)
 # APP
 # -------------------------------------------------
 
-app = FastAPI(title="Acinyx.AI Backend", version="5.1.0")
+app = FastAPI(title="Acinyx.AI Backend", version="5.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -222,20 +222,6 @@ def login(
 
 
 # -------------------------------------------------
-# GET CURRENT USER
-# -------------------------------------------------
-
-@app.get("/me")
-def get_me(user: User = Depends(get_current_user)):
-    return {
-        "username": user.username,
-        "plan": user.plan,
-        "chat_used": user.chat_used,
-        "poster_used": user.poster_used
-    }
-
-
-# -------------------------------------------------
 # PAYSTACK INIT
 # -------------------------------------------------
 
@@ -256,8 +242,7 @@ def init_paystack_payment(
     payload = {
         "email": user.email,
         "amount": body.amount,
-        "callback_url": "https://acinyx-ai.vercel.app/dashboard
-",
+        "callback_url": "https://acinyx-ai.vercel.app/dashboard",
         "metadata": {
             "username": user.username,
             "plan": body.plan
@@ -301,7 +286,7 @@ async def paystack_webhook(request: Request, db: Session = Depends(get_db)):
         hashlib.sha512
     ).hexdigest()
 
-    if not hmac.compare_digest(expected, signature):
+    if not signature or not hmac.compare_digest(expected, signature):
         raise HTTPException(400, "Invalid signature")
 
     payload = await request.json()
@@ -361,13 +346,19 @@ async def ai_chat(
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
     messages = [
-        {"role": "system", "content": f"You are Acinyx.AI. The current time is {now}."}
+        {
+            "role": "system",
+            "content": f"You are Acinyx.AI. The current time is {now}."
+        }
     ]
 
     for h in history:
         messages.append({"role": h.role, "content": h.content})
 
+    # ---------------------------------------------
     # Handle image input
+    # ---------------------------------------------
+
     if image:
         encoded = base64.b64encode(await image.read()).decode()
         mime = image.content_type or "image/png"
@@ -400,6 +391,10 @@ async def ai_chat(
             content=message
         ))
 
+    # ---------------------------------------------
+    # Generate AI response
+    # ---------------------------------------------
+
     response = client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=messages,
@@ -414,7 +409,10 @@ async def ai_chat(
         content=reply
     ))
 
+    # ---------------------------------------------
     # Usage deduction
+    # ---------------------------------------------
+
     user.chat_used += 1
     db.commit()
 
@@ -422,7 +420,7 @@ async def ai_chat(
 
 
 # -------------------------------------------------
-# POSTER GENERATION
+# POSTER GENERATION (PROFESSIONAL STRUCTURED PROMPT)
 # -------------------------------------------------
 
 SIZE_MAP = {
@@ -447,15 +445,47 @@ async def ai_poster(
     if user.poster_used >= PLANS[user.plan]["poster"]:
         raise HTTPException(403, "Poster limit reached")
 
+    if not title:
+        raise HTTPException(400, "Title is required")
+
     image_size = SIZE_MAP.get(size, "1024x1536")
 
-    prompt = f"""
-Create a professional poster.
+    # -------------------------------------------------
+    # PROFESSIONAL STRUCTURED POSTER PROMPT
+    # -------------------------------------------------
 
-Subject: {title}
-Message: {description}
-Style: {style}
+    prompt = f"""
+Design a high-quality commercial marketing poster.
+
+MAIN HEADLINE:
+{title}
+
+SUPPORTING MESSAGE:
+{description}
+
+VISUAL STYLE:
+{style}
+
+STRICT DESIGN REQUIREMENTS:
+- Strong bold headline typography
+- Clear visual hierarchy
+- Professional layout composition
+- Eye-catching modern marketing design
+- Balanced spacing and alignment
+- High contrast readability
+- Proper text placement
+- Realistic professional typography
+- Clean background integration
+- Suitable for social media and print
+- Make it visually powerful and attention-grabbing
+- It must look like a real professionally designed poster, not AI art
+
+The result must be production-level professional.
 """
+
+    # ---------------------------------------------
+    # Generate image
+    # ---------------------------------------------
 
     img = client.images.generate(
         model="gpt-image-1",
@@ -471,18 +501,26 @@ Style: {style}
     with open(path, "wb") as f:
         f.write(image_bytes)
 
-    # Watermark if plan requires it
+    # ---------------------------------------------
+    # Watermark if required by plan
+    # ---------------------------------------------
+
     if PLANS[user.plan]["watermark"]:
         im = Image.open(path).convert("RGBA")
         draw = ImageDraw.Draw(im)
+
         draw.text(
             (20, im.height - 40),
             "Acinyx.AI",
             fill=(255, 255, 255, 160)
         )
+
         im.save(path)
 
+    # ---------------------------------------------
     # Usage deduction
+    # ---------------------------------------------
+
     user.poster_used += 1
     db.commit()
 
