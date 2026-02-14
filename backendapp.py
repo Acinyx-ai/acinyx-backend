@@ -11,7 +11,6 @@ from sqlalchemy import Column, Integer, String, create_engine, or_, Text, Foreig
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 from passlib.context import CryptContext
-
 from datetime import datetime, timedelta
 from jose import jwt, JWTError
 
@@ -25,9 +24,12 @@ import hashlib
 
 from openai import OpenAI
 from PIL import Image, ImageDraw
-
 import uvicorn
 
+
+# -------------------------------------------------
+# CONFIG
+# -------------------------------------------------
 
 logging.basicConfig(level=logging.INFO)
 
@@ -36,6 +38,9 @@ if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY not set")
 
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
+if not PAYSTACK_SECRET_KEY:
+    raise RuntimeError("PAYSTACK_SECRET_KEY not set")
+
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 
 JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_SECRET")
@@ -44,6 +49,11 @@ JWT_EXPIRE_MINUTES = 60 * 24
 
 client = OpenAI()
 
+
+# -------------------------------------------------
+# DATABASE
+# -------------------------------------------------
+
 DATABASE_URL = "sqlite:///./acinyx.db"
 
 engine = create_engine(
@@ -51,17 +61,12 @@ engine = create_engine(
     connect_args={"check_same_thread": False}
 )
 
-SessionLocal = sessionmaker(
-    bind=engine,
-    autoflush=False,
-    autocommit=False
-)
-
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
 
 # -------------------------------------------------
-# Models
+# MODELS
 # -------------------------------------------------
 
 class User(Base):
@@ -81,7 +86,7 @@ class ChatMemory(Base):
 
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), index=True)
-    role = Column(String)   # user | assistant
+    role = Column(String)
     content = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -89,7 +94,11 @@ class ChatMemory(Base):
 Base.metadata.create_all(bind=engine)
 
 
-app = FastAPI(title="Acinyx.AI Backend", version="4.3.0")
+# -------------------------------------------------
+# APP
+# -------------------------------------------------
+
+app = FastAPI(title="Acinyx.AI Backend", version="5.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -98,17 +107,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+os.makedirs("outputs", exist_ok=True)
+app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 
+# -------------------------------------------------
+# HELPERS
+# -------------------------------------------------
+
 def hash_password(p: str):
     return pwd_context.hash(p)
 
-
 def verify_password(p: str, h: str):
     return pwd_context.verify(p, h)
-
 
 def get_db():
     db = SessionLocal()
@@ -117,13 +131,11 @@ def get_db():
     finally:
         db.close()
 
-
 def create_access_token(data: dict):
-    to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(minutes=JWT_EXPIRE_MINUTES)
+    to_encode = data.copy()
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
 
 def get_current_user(
     token: str = Depends(oauth2_scheme),
@@ -133,16 +145,20 @@ def get_current_user(
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         username = payload.get("sub")
         if not username:
-            raise HTTPException(status_code=401, detail="Invalid token")
+            raise HTTPException(401, "Invalid token")
     except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        raise HTTPException(401, "Invalid token")
 
     user = db.query(User).filter(User.username == username).first()
     if not user:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        raise HTTPException(401, "Invalid token")
 
     return user
 
+
+# -------------------------------------------------
+# PLANS
+# -------------------------------------------------
 
 PLANS = {
     "free": {"chat": 5, "poster": 2, "watermark": True},
@@ -151,12 +167,9 @@ PLANS = {
     "mega": {"chat": 2000, "poster": 300, "watermark": False},
 }
 
-os.makedirs("outputs", exist_ok=True)
-app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
-
 
 # -------------------------------------------------
-# Auth
+# AUTH
 # -------------------------------------------------
 
 class SignupBody(BaseModel):
@@ -193,69 +206,42 @@ def login(
 ):
 
     user = db.query(User).filter(
-        or_(
-            User.username == form.username,
-            User.email == form.username
-        )
+        or_(User.username == form.username, User.email == form.username)
     ).first()
 
     if not user or not verify_password(form.password, user.password_hash):
         raise HTTPException(401, "Invalid credentials")
 
-    access_token = create_access_token({"sub": user.username})
+    token = create_access_token({"sub": user.username})
 
     return {
-        "access_token": access_token,
+        "access_token": token,
         "token_type": "bearer",
         "plan": user.plan
     }
 
 
 # -------------------------------------------------
-# News helper
+# GET CURRENT USER
 # -------------------------------------------------
 
-def fetch_newsapi_news(query: str, limit: int = 5) -> str:
-    if not NEWS_API_KEY:
-        return ""
-
-    try:
-        r = requests.get(
-            "https://newsapi.org/v2/everything",
-            params={
-                "q": query,
-                "language": "en",
-                "pageSize": limit,
-                "sortBy": "publishedAt",
-                "apiKey": NEWS_API_KEY
-            },
-            timeout=10
-        )
-
-        data = r.json()
-        items = data.get("articles", [])
-
-        lines = []
-        for n in items:
-            title = n.get("title")
-            source = (n.get("source") or {}).get("name", "")
-            date = n.get("publishedAt", "")
-            lines.append(f"- {title} ({source}, {date})")
-
-        return "\n".join(lines)
-
-    except Exception:
-        return ""
+@app.get("/me")
+def get_me(user: User = Depends(get_current_user)):
+    return {
+        "username": user.username,
+        "plan": user.plan,
+        "chat_used": user.chat_used,
+        "poster_used": user.poster_used
+    }
 
 
 # -------------------------------------------------
-# Paystack init
-# (amount must already be in the smallest unit)
+# PAYSTACK INIT
 # -------------------------------------------------
 
 class PaystackInitBody(BaseModel):
     amount: int
-    plan: str | None = None
+    plan: str
 
 
 @app.post("/payments/paystack/init")
@@ -264,12 +250,14 @@ def init_paystack_payment(
     user: User = Depends(get_current_user)
 ):
 
-    if not PAYSTACK_SECRET_KEY:
-        raise HTTPException(500, "PAYSTACK_SECRET_KEY not set")
+    if body.plan not in PLANS:
+        raise HTTPException(400, "Invalid plan")
 
     payload = {
         "email": user.email,
         "amount": body.amount,
+        "callback_url": "https://acinyx-ai.vercel.app/dashboard
+",
         "metadata": {
             "username": user.username,
             "plan": body.plan
@@ -298,7 +286,7 @@ def init_paystack_payment(
 
 
 # -------------------------------------------------
-# Paystack webhook
+# PAYSTACK WEBHOOK
 # -------------------------------------------------
 
 @app.post("/payments/paystack/webhook")
@@ -306,9 +294,6 @@ async def paystack_webhook(request: Request, db: Session = Depends(get_db)):
 
     raw_body = await request.body()
     signature = request.headers.get("x-paystack-signature")
-
-    if not signature:
-        raise HTTPException(400, "Missing signature")
 
     expected = hmac.new(
         PAYSTACK_SECRET_KEY.encode(),
@@ -330,28 +315,17 @@ async def paystack_webhook(request: Request, db: Session = Depends(get_db)):
     username = metadata.get("username")
     plan = metadata.get("plan")
 
-    if not username or not plan:
-        return {"status": "missing metadata"}
-
     user = db.query(User).filter(User.username == username).first()
 
-    if not user:
-        return {"status": "user not found"}
-
-    if plan not in PLANS:
-        return {"status": "invalid plan"}
-
-    user.plan = plan
-    user.chat_used = 0
-    user.poster_used = 0
-
-    db.commit()
+    if user and plan in PLANS:
+        user.plan = plan
+        user.chat_used = 0
+        user.poster_used = 0
+        db.commit()
 
     return {"status": "ok"}
-
-
 # -------------------------------------------------
-# Chat with memory (no sessions)
+# CHAT WITH MEMORY
 # -------------------------------------------------
 
 MAX_HISTORY = 12
@@ -386,18 +360,14 @@ async def ai_chat(
 
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
-    news_context = fetch_newsapi_news(message) if message else ""
-
-    system_prompt = f"You are Acinyx.AI. The current date and time is {now}."
-
-    if news_context:
-        system_prompt += "\n\nLatest relevant news:\n" + news_context
-
-    messages = [{"role": "system", "content": system_prompt}]
+    messages = [
+        {"role": "system", "content": f"You are Acinyx.AI. The current time is {now}."}
+    ]
 
     for h in history:
         messages.append({"role": h.role, "content": h.content})
 
+    # Handle image input
     if image:
         encoded = base64.b64encode(await image.read()).decode()
         mime = image.content_type or "image/png"
@@ -444,6 +414,7 @@ async def ai_chat(
         content=reply
     ))
 
+    # Usage deduction
     user.chat_used += 1
     db.commit()
 
@@ -451,7 +422,7 @@ async def ai_chat(
 
 
 # -------------------------------------------------
-# Poster
+# POSTER GENERATION
 # -------------------------------------------------
 
 SIZE_MAP = {
@@ -500,17 +471,27 @@ Style: {style}
     with open(path, "wb") as f:
         f.write(image_bytes)
 
+    # Watermark if plan requires it
     if PLANS[user.plan]["watermark"]:
         im = Image.open(path).convert("RGBA")
         draw = ImageDraw.Draw(im)
-        draw.text((20, im.height - 40), "Acinyx.AI", fill=(255, 255, 255, 160))
+        draw.text(
+            (20, im.height - 40),
+            "Acinyx.AI",
+            fill=(255, 255, 255, 160)
+        )
         im.save(path)
 
+    # Usage deduction
     user.poster_used += 1
     db.commit()
 
     return {"poster_url": f"/outputs/{filename}"}
 
+
+# -------------------------------------------------
+# RUN SERVER
+# -------------------------------------------------
 
 if __name__ == "__main__":
     uvicorn.run(
