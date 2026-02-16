@@ -51,14 +51,18 @@ client = OpenAI()
 
 
 # -------------------------------------------------
-# DATABASE
+# DATABASE (PERSISTENT FIX)
 # -------------------------------------------------
 
-DATABASE_URL = "sqlite:///./acinyx.db"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "acinyx.db")
+
+DATABASE_URL = f"sqlite:///{DB_PATH}"
 
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False}
+    connect_args={"check_same_thread": False},
+    pool_pre_ping=True
 )
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
@@ -72,9 +76,9 @@ Base = declarative_base()
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(Integer, primary_key=True)
-    username = Column(String, unique=True, index=True, nullable=False)
-    email = Column(String, unique=True, index=True, nullable=False)
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(100), unique=True, index=True, nullable=False)
+    email = Column(String(150), unique=True, index=True, nullable=False)
     password_hash = Column(String, nullable=False)
     plan = Column(String, default="free")
     chat_used = Column(Integer, default=0)
@@ -84,9 +88,9 @@ class User(Base):
 class ChatMemory(Base):
     __tablename__ = "chat_memory"
 
-    id = Column(Integer, primary_key=True)
+    id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), index=True)
-    role = Column(String)
+    role = Column(String(20))
     content = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -98,7 +102,11 @@ Base.metadata.create_all(bind=engine)
 # APP
 # -------------------------------------------------
 
+<<<<<<< HEAD
 app = FastAPI(title="Acinyx.AI Backend", version="5.2.0")
+=======
+app = FastAPI(title="Acinyx.AI Backend", version="5.3.1")
+>>>>>>> 599c4e6 (Fixed persistent database and finalized backend)
 
 app.add_middleware(
     CORSMiddleware,
@@ -118,11 +126,11 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 # HELPERS
 # -------------------------------------------------
 
-def hash_password(p: str):
-    return pwd_context.hash(p)
+def hash_password(password: str):
+    return pwd_context.hash(password)
 
-def verify_password(p: str, h: str):
-    return pwd_context.verify(p, h)
+def verify_password(password: str, hashed: str):
+    return pwd_context.verify(password, hashed)
 
 def get_db():
     db = SessionLocal()
@@ -195,6 +203,7 @@ def signup(data: SignupBody, db: Session = Depends(get_db)):
 
     db.add(user)
     db.commit()
+    db.refresh(user)
 
     return {"message": "Account created"}
 
@@ -420,7 +429,11 @@ async def ai_chat(
 
 
 # -------------------------------------------------
+<<<<<<< HEAD
 # POSTER GENERATION (PROFESSIONAL STRUCTURED PROMPT)
+=======
+# POSTER GENERATION (FULL STRUCTURED PROMPT)
+>>>>>>> 599c4e6 (Fixed persistent database and finalized backend)
 # -------------------------------------------------
 
 SIZE_MAP = {
