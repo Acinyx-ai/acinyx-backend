@@ -3,21 +3,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordBearer,OAuth2PasswordRequestForm
 from pydantic import BaseModel
-
 from sqlalchemy import Column,Integer,String,create_engine,or_,Text,ForeignKey,DateTime
 from sqlalchemy.orm import sessionmaker,declarative_base,Session
-
 from passlib.context import CryptContext
 from datetime import datetime,timedelta
 from jose import jwt,JWTError
-
-import os,time,base64,logging,requests,hmac,hashlib,uuid
-
+import os,base64,logging,requests,hmac,hashlib,uuid
 from openai import OpenAI
 from PIL import Image,ImageDraw
 import uvicorn
 
-# CONFIG
+# ---------------- CONFIG ----------------
 
 logging.basicConfig(level=logging.INFO)
 logger=logging.getLogger("acinyx")
@@ -28,7 +24,7 @@ NEWS_API_KEY=os.getenv("NEWS_API_KEY")
 
 JWT_SECRET=os.getenv("JWT_SECRET","CHANGE_THIS_SECRET")
 JWT_ALGORITHM="HS256"
-JWT_EXPIRE_MINUTES=60*24
+JWT_EXPIRE_DAYS=30
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY not set")
@@ -38,116 +34,113 @@ if not PAYSTACK_SECRET_KEY:
 
 client=OpenAI()
 
-# DATABASE (PostgreSQL + SQLite fallback)
+# ---------------- DATABASE ----------------
 
 BASE_DIR=os.path.dirname(os.path.abspath(__file__))
 SQLITE_PATH=os.path.join(BASE_DIR,"acinyx.db")
-
 DATABASE_URL=os.getenv("DATABASE_URL")
 
 if DATABASE_URL:
-
     if DATABASE_URL.startswith("postgres://"):
         DATABASE_URL=DATABASE_URL.replace("postgres://","postgresql://",1)
 
-    logger.info("Using PostgreSQL")
-
-    engine=create_engine(
-        DATABASE_URL,
-        pool_pre_ping=True
-    )
+    engine=create_engine(DATABASE_URL,pool_pre_ping=True)
 
 else:
-
-    logger.info("Using SQLite")
-
     engine=create_engine(
         f"sqlite:///{SQLITE_PATH}",
         connect_args={"check_same_thread":False},
         pool_pre_ping=True
     )
 
-SessionLocal=sessionmaker(
-    bind=engine,
-    autoflush=False,
-    autocommit=False
-)
-
+SessionLocal=sessionmaker(bind=engine,autoflush=False,autocommit=False)
 Base=declarative_base()
 
-# MODELS
+# ---------------- MODELS ----------------
 
 class User(Base):
+
     __tablename__="users"
+
     id=Column(Integer,primary_key=True,index=True)
-    username=Column(String(100),unique=True,index=True,nullable=False)
-    email=Column(String(150),unique=True,index=True,nullable=False)
-    password_hash=Column(String,nullable=False)
+    username=Column(String(100),unique=True,index=True)
+    email=Column(String(150),unique=True,index=True)
+    password_hash=Column(String)
+
     plan=Column(String,default="free")
+
     chat_used=Column(Integer,default=0)
     poster_used=Column(Integer,default=0)
 
+
 class ChatMemory(Base):
+
     __tablename__="chat_memory"
+
     id=Column(Integer,primary_key=True,index=True)
-    user_id=Column(Integer,ForeignKey("users.id"),index=True)
+
+    user_id=Column(Integer,ForeignKey("users.id"))
+
     role=Column(String(20))
     content=Column(Text)
+
     created_at=Column(DateTime,default=datetime.utcnow)
+
 
 Base.metadata.create_all(bind=engine)
 
-# APP
+# ---------------- APP ----------------
 
-app=FastAPI(title="Acinyx.AI Backend",version="6.0.0")
-
-# CORS
+app=FastAPI(title="Acinyx.AI Backend",version="FINAL")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
-
-# STATIC
 
 os.makedirs("outputs",exist_ok=True)
 app.mount("/outputs",StaticFiles(directory="outputs"),name="outputs")
 
-# SECURITY
+# ---------------- SECURITY ----------------
 
 pwd_context=CryptContext(schemes=["bcrypt"],deprecated="auto")
 oauth2_scheme=OAuth2PasswordBearer(tokenUrl="token")
 
-# HELPERS
+def hash_password(p:str):
+    return pwd_context.hash(p)
 
-def hash_password(password:str):
-    return pwd_context.hash(password)
+def verify_password(p:str,h:str):
+    return pwd_context.verify(p,h)
 
-def verify_password(password:str,hashed:str):
-    return pwd_context.verify(password,hashed)
 
 def get_db():
+
     db=SessionLocal()
+
     try:
         yield db
     finally:
         db.close()
 
+
 def create_access_token(data:dict):
-    expire=datetime.utcnow()+timedelta(minutes=JWT_EXPIRE_MINUTES)
-    to_encode=data.copy()
-    to_encode.update({"exp":expire})
-    return jwt.encode(to_encode,JWT_SECRET,algorithm=JWT_ALGORITHM)
+
+    expire=datetime.utcnow()+timedelta(days=JWT_EXPIRE_DAYS)
+
+    data.update({"exp":expire})
+
+    return jwt.encode(data,JWT_SECRET,algorithm=JWT_ALGORITHM)
+
 
 def get_current_user(token:str=Depends(oauth2_scheme),db:Session=Depends(get_db)):
+
     try:
         payload=jwt.decode(token,JWT_SECRET,algorithms=[JWT_ALGORITHM])
         username=payload.get("sub")
-        if not username:
-            raise HTTPException(401,"Invalid token")
+
     except JWTError:
         raise HTTPException(401,"Invalid token")
 
@@ -157,46 +150,64 @@ def get_current_user(token:str=Depends(oauth2_scheme),db:Session=Depends(get_db)
         raise HTTPException(401,"Invalid token")
 
     return user
-# PLANS
+
+
+# ---------------- PLANS ----------------
 
 PLANS={
-    "free":{"chat":5,"poster":2,"watermark":True},
-    "basic":{"chat":100,"poster":20,"watermark":False},
-    "pro":{"chat":500,"poster":100,"watermark":False},
-    "mega":{"chat":2000,"poster":300,"watermark":False},
+
+"free":{"chat":50,"poster":2,"watermark":True},
+
+"basic":{"chat":100,"poster":20,"watermark":False},
+
+"pro":{"chat":500,"poster":100,"watermark":False},
+
+"mega":{"chat":2000,"poster":300,"watermark":False},
+
 }
 
-# AUTH
+
+# ---------------- SIGNUP ----------------
 
 class SignupBody(BaseModel):
+
     username:str
     email:str
     password:str
 
+
 @app.post("/signup")
+
 def signup(data:SignupBody,db:Session=Depends(get_db)):
 
     if db.query(User).filter(User.username==data.username).first():
+
         raise HTTPException(400,"User exists")
 
-    if db.query(User).filter(User.email==data.email).first():
-        raise HTTPException(400,"Email already registered")
 
     user=User(
+
         username=data.username,
+
         email=data.email,
+
         password_hash=hash_password(data.password)
+
     )
 
     db.add(user)
+
     db.commit()
+
     db.refresh(user)
 
-    logger.info(f"New user created: {user.username}")
+    return{"message":"Account created"}
 
-    return {"message":"Account created"}
+
+# ---------------- LOGIN ----------------
 
 @app.post("/token")
+
 def login(form:OAuth2PasswordRequestForm=Depends(),db:Session=Depends(get_db)):
 
     user=db.query(User).filter(
@@ -204,291 +215,265 @@ def login(form:OAuth2PasswordRequestForm=Depends(),db:Session=Depends(get_db)):
     ).first()
 
     if not user or not verify_password(form.password,user.password_hash):
+
         raise HTTPException(401,"Invalid credentials")
 
     token=create_access_token({"sub":user.username})
 
     return{
+
         "access_token":token,
+
         "token_type":"bearer",
+
         "plan":user.plan
+
     }
 
-# PAYSTACK INIT
+
+# ---------------- PAYSTACK INIT ----------------
 
 class PaystackInitBody(BaseModel):
+
     amount:int
+
     plan:str
 
+
 @app.post("/payments/paystack/init")
-def init_paystack_payment(body:PaystackInitBody,user:User=Depends(get_current_user)):
+
+def init_payment(body:PaystackInitBody,user:User=Depends(get_current_user)):
 
     if body.plan not in PLANS:
+
         raise HTTPException(400,"Invalid plan")
 
     payload={
+
         "email":user.email,
+
         "amount":body.amount,
-        "callback_url":"https://acinyx-ai.vercel.app/dashboard",
-        "metadata":{
-            "username":user.username,
-            "plan":body.plan
-        }
+
+        "callback_url":"https://acinyx-frontend.vercel.app/dashboard",
+
+        "metadata":{"username":user.username,"plan":body.plan}
+
     }
 
     r=requests.post(
+
         "https://api.paystack.co/transaction/initialize",
+
         json=payload,
-        headers={
-            "Authorization":f"Bearer {PAYSTACK_SECRET_KEY}",
-            "Content-Type":"application/json"
-        },
-        timeout=20
+
+        headers={"Authorization":f"Bearer {PAYSTACK_SECRET_KEY}"}
+
     )
 
-    data=r.json()
+    return r.json()["data"]
 
-    if not data.get("status"):
-        raise HTTPException(400,data.get("message"))
 
-    return{
-        "authorization_url":data["data"]["authorization_url"],
-        "reference":data["data"]["reference"]
-    }
-
-# PAYSTACK WEBHOOK
+# ---------------- PAYSTACK WEBHOOK ----------------
 
 @app.post("/payments/paystack/webhook")
-async def paystack_webhook(request:Request,db:Session=Depends(get_db)):
 
-    raw_body=await request.body()
-    signature=request.headers.get("x-paystack-signature")
+async def webhook(request:Request,db:Session=Depends(get_db)):
+
+    raw=await request.body()
+
+    sig=request.headers.get("x-paystack-signature")
 
     expected=hmac.new(
+
         PAYSTACK_SECRET_KEY.encode(),
-        raw_body,
+
+        raw,
+
         hashlib.sha512
+
     ).hexdigest()
 
-    if not signature or not hmac.compare_digest(expected,signature):
+    if not sig or not hmac.compare_digest(expected,sig):
+
         raise HTTPException(400,"Invalid signature")
+
 
     payload=await request.json()
 
-    if payload.get("event")!="charge.success":
-        return{"status":"ignored"}
+    meta=payload["data"]["metadata"]
 
-    metadata=payload.get("data",{}).get("metadata",{})
-    username=metadata.get("username")
-    plan=metadata.get("plan")
+    user=db.query(User).filter(User.username==meta["username"]).first()
 
-    if not username or not plan:
-        logger.error("Missing metadata")
-        return{"status":"error"}
+    user.plan=meta["plan"]
 
-    user=db.query(User).filter(User.username==username).first()
-
-    if not user:
-        logger.error("User not found")
-        return{"status":"error"}
-
-    if plan not in PLANS:
-        logger.error("Invalid plan")
-        return{"status":"error"}
-
-    user.plan=plan
     user.chat_used=0
+
     user.poster_used=0
 
     db.commit()
 
-    logger.info(f"Plan upgraded {username}->{plan}")
-
     return{"status":"ok"}
 
-# CHAT
+
+# ---------------- CHAT ----------------
 
 MAX_HISTORY=12
 
+
 @app.post("/ai/chat")
-async def ai_chat(
-    message:str=Form(None),
-    image:UploadFile=File(None),
+
+async def chat(
+
+    message:str=Form(...),
+
     user:User=Depends(get_current_user),
+
     db:Session=Depends(get_db)
+
 ):
 
     if user.chat_used>=PLANS[user.plan]["chat"]:
-        raise HTTPException(403,"Chat limit reached")
 
-    if not message and not image:
-        raise HTTPException(400,"Message required")
+        raise HTTPException(403,"Limit reached")
 
-    history=db.query(ChatMemory)\
-        .filter(ChatMemory.user_id==user.id)\
-        .order_by(ChatMemory.created_at.desc())\
-        .limit(MAX_HISTORY)\
-        .all()
 
-    history.reverse()
+    history=db.query(ChatMemory).filter(
 
-    messages=[{
-        "role":"system",
-        "content":"You are Acinyx.AI"
-    }]
+        ChatMemory.user_id==user.id
+
+    ).limit(MAX_HISTORY).all()
+
+
+    msgs=[{"role":"system","content":"You are Acinyx.AI"}]
+
 
     for h in history:
-        messages.append({
-            "role":h.role,
-            "content":h.content
-        })
 
-    if image:
+        msgs.append({"role":h.role,"content":h.content})
 
-        image_bytes=await image.read()
-        encoded=base64.b64encode(image_bytes).decode()
 
-        messages.append({
-            "role":"user",
-            "content":[
-                {"type":"text","text":message or "Describe image"},
-                {
-                    "type":"image_url",
-                    "image_url":{
-                        "url":f"data:{image.content_type};base64,{encoded}"
-                    }
-                }
-            ]
-        })
+    msgs.append({"role":"user","content":message})
 
-        db.add(ChatMemory(
-            user_id=user.id,
-            role="user",
-            content=message or "[image]"
-        ))
+
+    if "generate image" in message.lower():
+
+        img=client.images.generate(
+
+            model="gpt-image-1",
+
+            prompt=message,
+
+            size="1024x1024"
+
+        )
+
+        image_bytes=base64.b64decode(img.data[0].b64_json)
+
+        filename=f"{uuid.uuid4()}.png"
+
+        path=f"outputs/{filename}"
+
+        open(path,"wb").write(image_bytes)
+
+        reply=f"/outputs/{filename}"
 
     else:
 
-        messages.append({
-            "role":"user",
-            "content":message
-        })
+        res=client.chat.completions.create(
 
-        db.add(ChatMemory(
-            user_id=user.id,
-            role="user",
-            content=message
-        ))
+            model="gpt-4.1-mini",
 
-    response=client.chat.completions.create(
-        model="gpt-4.1-mini",
-        messages=messages
-    )
+            messages=msgs
 
-    reply=response.choices[0].message.content
+        )
 
-    db.add(ChatMemory(
-        user_id=user.id,
-        role="assistant",
-        content=reply
-    ))
+        reply=res.choices[0].message.content
+
+
+    db.add(ChatMemory(user_id=user.id,role="user",content=message))
+
+    db.add(ChatMemory(user_id=user.id,role="assistant",content=reply))
+
 
     user.chat_used+=1
+
     db.commit()
 
-    image_url=None
 
-    if reply and "/outputs/" in reply:
-        start=reply.find("/outputs/")
-        end=reply.find(".png",start)
-        if end!=-1:
-            image_url=reply[start:end+4]
+    return{"reply":reply}
 
-    return{
-        "reply":reply,
-        "image":image_url
-    }
 
-# POSTER GENERATION
+# ---------------- POSTER ----------------
 
-SIZE_MAP={
-    "portrait":"1024x1536",
-    "square":"1024x1024",
-    "landscape":"1536x1024"
-}
+@app.post("/ai/poster")
 
-@app.post("/ai/poster/ai-generate")
-async def ai_poster(
+async def poster(
+
     title:str=Form(...),
-    description:str=Form(""),
-    style:str=Form("modern"),
-    size:str=Form("portrait"),
+
     user:User=Depends(get_current_user),
+
     db:Session=Depends(get_db)
+
 ):
 
-    if user.poster_used>=PLANS[user.plan]["poster"]:
-        raise HTTPException(403,"Limit reached")
-
-    prompt=f"""
-Create professional marketing poster
-Title:{title}
-Description:{description}
-Style:{style}
-"""
-
     img=client.images.generate(
+
         model="gpt-image-1",
-        prompt=prompt,
-        size=SIZE_MAP.get(size,"1024x1536")
+
+        prompt=title,
+
+        size="1024x1536"
+
     )
 
     image_bytes=base64.b64decode(img.data[0].b64_json)
 
     filename=f"{uuid.uuid4()}.png"
+
     path=f"outputs/{filename}"
 
-    with open(path,"wb") as f:
-        f.write(image_bytes)
+    open(path,"wb").write(image_bytes)
+
+
+    if PLANS[user.plan]["watermark"]:
+
+        im=Image.open(path)
+
+        draw=ImageDraw.Draw(im)
+
+        draw.text((20,20),"Acinyx.AI")
+
+        im.save(path)
+
 
     user.poster_used+=1
+
     db.commit()
 
-    return{
-        "reply":f"/outputs/{filename}",
-        "image":f"/outputs/{filename}"
-    }
 
-# NEWS
+    return{"image":path}
 
-@app.get("/news")
-def news():
 
-    if not NEWS_API_KEY:
-        return[]
-
-    r=requests.get(
-        "https://newsapi.org/v2/top-headlines",
-        params={
-            "country":"us",
-            "apiKey":NEWS_API_KEY
-        }
-    )
-
-    return r.json()
-
-# HEALTH
+# ---------------- HEALTH ----------------
 
 @app.get("/health")
+
 def health():
+
     return{"status":"ok"}
 
-# SERVER
+
+# ---------------- SERVER ----------------
 
 if __name__=="__main__":
 
     uvicorn.run(
+
         "backendapp:app",
+
         host="0.0.0.0",
+
         port=8000
+
     )
