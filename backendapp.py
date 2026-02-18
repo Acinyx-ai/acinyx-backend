@@ -1,381 +1,378 @@
-from fastapi import FastAPI,HTTPException,Depends,Form,Request,UploadFile,File
+from fastapi import FastAPI, HTTPException, Depends, Form, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.security import OAuth2PasswordBearer,OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 
 from pydantic import BaseModel
 
-from sqlalchemy import Column,Integer,String,create_engine,or_,Text,ForeignKey,DateTime
-from sqlalchemy.orm import sessionmaker,declarative_base,Session
+from sqlalchemy import Column, Integer, String, create_engine, or_, Text, DateTime
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 from passlib.context import CryptContext
 
-from datetime import datetime,timedelta
+from datetime import datetime, timedelta
 
-from jose import jwt,JWTError
+from jose import jwt, JWTError
 
-import os,base64,requests,hmac,hashlib,uuid,logging
+import os, base64, uuid, logging
 
 from openai import OpenAI
-
-from PIL import Image,ImageDraw
 
 import uvicorn
 
 
-# CONFIG
+# ---------------- CONFIG ----------------
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("acinyx")
 
-logger=logging.getLogger("acinyx")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
+JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_SECRET")
 
-OPENAI_API_KEY=os.getenv("OPENAI_API_KEY")
-
-DATABASE_URL=os.getenv("DATABASE_URL")
-
-PAYSTACK_SECRET_KEY=os.getenv("PAYSTACK_SECRET_KEY")
-
-JWT_SECRET=os.getenv("JWT_SECRET","CHANGE_THIS_SECRET")
-
-JWT_ALGORITHM="HS256"
-
-JWT_EXPIRE_DAYS=30
-
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_DAYS = 30
 
 if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-    DATABASE_URL=DATABASE_URL.replace("postgres://","postgresql://",1)
-
-
-client=OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 
+# ---------------- DATABASE ----------------
 
-# DATABASE
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    pool_recycle=300
+)
 
-engine=create_engine(DATABASE_URL,pool_pre_ping=True,pool_recycle=300)
-
-SessionLocal=sessionmaker(bind=engine)
-
-Base=declarative_base()
-
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
 
 
 class User(Base):
 
-    __tablename__="users"
+    __tablename__ = "users"
 
-    id=Column(Integer,primary_key=True)
+    id = Column(Integer, primary_key=True)
 
-    username=Column(String,unique=True)
+    username = Column(String, unique=True)
 
-    email=Column(String,unique=True)
+    email = Column(String, unique=True)
 
-    password_hash=Column(String)
+    password_hash = Column(String)
 
-    plan=Column(String,default="free")
+    plan = Column(String, default="free")
 
-    chat_used=Column(Integer,default=0)
+    chat_used = Column(Integer, default=0)
 
-    poster_used=Column(Integer,default=0)
-
+    poster_used = Column(Integer, default=0)
 
 
 class ChatMemory(Base):
 
-    __tablename__="chat_memory"
+    __tablename__ = "chat_memory"
 
-    id=Column(Integer,primary_key=True)
+    id = Column(Integer, primary_key=True)
 
-    user_id=Column(Integer)
+    user_id = Column(Integer)
 
-    role=Column(String)
+    role = Column(String)
 
-    content=Column(Text)
+    content = Column(Text)
 
-    created_at=Column(DateTime,default=datetime.utcnow)
-
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 Base.metadata.create_all(bind=engine)
 
 
+# ---------------- APP ----------------
 
-# APP
-
-app=FastAPI()
+app = FastAPI()
 
 app.add_middleware(
-
-CORSMiddleware,
-
-allow_origins=["*"],
-
-allow_methods=["*"],
-
-allow_headers=["*"],
-
-allow_credentials=True
-
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
 )
 
+os.makedirs("outputs", exist_ok=True)
 
-os.makedirs("outputs",exist_ok=True)
-
-app.mount("/outputs",StaticFiles(directory="outputs"),name="outputs")
-
+app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
 
 
-# SECURITY
+# ---------------- SECURITY ----------------
 
-pwd_context=CryptContext(schemes=["bcrypt"])
+pwd_context = CryptContext(schemes=["bcrypt"])
 
-oauth2_scheme=OAuth2PasswordBearer(tokenUrl="token")
-
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 
 def get_db():
 
-    db=SessionLocal()
+    db = SessionLocal()
 
     try:
-
         yield db
-
     finally:
-
         db.close()
-
 
 
 def create_access_token(data):
 
-    expire=datetime.utcnow()+timedelta(days=JWT_EXPIRE_DAYS)
+    expire = datetime.utcnow() + timedelta(days=JWT_EXPIRE_DAYS)
 
-    data.update({"exp":expire})
+    data.update({"exp": expire})
 
-    return jwt.encode(data,JWT_SECRET,algorithm=JWT_ALGORITHM)
+    return jwt.encode(data, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
-
-def get_current_user(token:str=Depends(oauth2_scheme),db:Session=Depends(get_db)):
+def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db)
+):
 
     try:
 
-        payload=jwt.decode(token,JWT_SECRET,algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM]
+        )
 
-        username=payload.get("sub")
+        username = payload.get("sub")
 
-    except:
+    except JWTError:
 
-        raise HTTPException(401)
+        raise HTTPException(401, "Invalid token")
 
-
-    user=db.query(User).filter(User.username==username).first()
+    user = db.query(User).filter(
+        User.username == username
+    ).first()
 
     if not user:
-
-        raise HTTPException(401)
+        raise HTTPException(401, "Invalid token")
 
     return user
 
 
-
-
-# CHAT WITH IMAGE + HUMANIZER SUPPORT
+# ---------------- CHAT ----------------
 
 @app.post("/ai/chat")
-
 async def chat(
 
-message:str=Form(""),
+    message: str = Form(""),
 
-mode:str=Form("chat"),
+    mode: str = Form("chat"),
 
-image:UploadFile|None=File(None),
+    image: UploadFile | None = File(None),
 
-user:User=Depends(get_current_user),
+    user: User = Depends(get_current_user),
 
-db:Session=Depends(get_db)
+    db: Session = Depends(get_db)
 
 ):
 
+    if user.chat_used >= 50:
 
-if user.chat_used>=50:
-
-    raise HTTPException(403,"Limit reached")
-
+        raise HTTPException(403, "Limit reached")
 
 
-reply=None
+    reply = None
 
-image_path=None
+    image_path = None
 
 
+    # IMAGE MODE
 
-# IMAGE GENERATION MODE
+    if mode == "image":
 
-if mode=="image":
+        img = client.images.generate(
 
-    img=client.images.generate(
+            model="gpt-image-1",
 
-    model="gpt-image-1",
+            prompt=message,
 
-    prompt=message,
+            size="1024x1024"
 
-    size="1024x1024"
+        )
+
+        image_bytes = base64.b64decode(
+
+            img.data[0].b64_json
+
+        )
+
+        filename = f"{uuid.uuid4()}.png"
+
+        path = f"outputs/{filename}"
+
+        with open(path, "wb") as f:
+
+            f.write(image_bytes)
+
+        reply = "Here is your image."
+
+        image_path = path
+
+
+    # HUMANIZE MODE
+
+    elif mode == "humanize":
+
+        res = client.chat.completions.create(
+
+            model="gpt-4.1-mini",
+
+            messages=[
+
+                {
+
+                    "role": "system",
+
+                    "content":
+                    "Rewrite this text to sound natural and human."
+
+                },
+
+                {
+
+                    "role": "user",
+
+                    "content": message
+
+                }
+
+            ]
+
+        )
+
+        reply = res.choices[0].message.content
+
+
+    # NORMAL CHAT
+
+    else:
+
+        res = client.chat.completions.create(
+
+            model="gpt-4.1-mini",
+
+            messages=[
+
+                {
+
+                    "role": "user",
+
+                    "content": message
+
+                }
+
+            ]
+
+        )
+
+        reply = res.choices[0].message.content
+
+
+    # SAVE
+
+    db.add(ChatMemory(
+
+        user_id=user.id,
+
+        role="user",
+
+        content=message
+
+    ))
+
+    db.add(ChatMemory(
+
+        user_id=user.id,
+
+        role="assistant",
+
+        content=reply
+
+    ))
+
+    user.chat_used += 1
+
+    db.commit()
+
+
+    return {
+
+        "reply": reply,
+
+        "image": image_path
+
+    }
+
+
+# ---------------- POSTER ----------------
+
+@app.post("/ai/poster")
+async def poster(
+
+    title: str = Form(...),
+
+    user: User = Depends(get_current_user),
+
+    db: Session = Depends(get_db)
+
+):
+
+    img = client.images.generate(
+
+        model="gpt-image-1",
+
+        prompt=title,
+
+        size="1024x1536"
 
     )
 
+    image_bytes = base64.b64decode(
 
+        img.data[0].b64_json
 
-    image_bytes=base64.b64decode(img.data[0].b64_json)
+    )
 
-    filename=f"{uuid.uuid4()}.png"
+    filename = f"{uuid.uuid4()}.png"
 
-    path=f"outputs/{filename}"
+    path = f"outputs/{filename}"
 
-
-    with open(path,"wb") as f:
+    with open(path, "wb") as f:
 
         f.write(image_bytes)
 
+    user.poster_used += 1
 
-    image_path=path
+    db.commit()
 
-    reply="Here is your image."
+    return {"image": path}
 
 
-
-# HUMANIZER MODE
-
-elif mode=="humanize":
-
-    res=client.chat.completions.create(
-
-    model="gpt-4.1-mini",
-
-    messages=[
-
-    {
-
-    "role":"system",
-
-    "content":"Rewrite this text to sound completely human and natural."
-
-    },
-
-    {"role":"user","content":message}
-
-    ]
-
-    )
-
-
-
-    reply=res.choices[0].message.content
-
-
-
-# NORMAL CHAT
-
-else:
-
-    res=client.chat.completions.create(
-
-    model="gpt-4.1-mini",
-
-    messages=[{"role":"user","content":message}]
-
-    )
-
-
-    reply=res.choices[0].message.content
-
-
-
-# SAVE MEMORY
-
-db.add(ChatMemory(user_id=user.id,role="user",content=message))
-
-db.add(ChatMemory(user_id=user.id,role="assistant",content=reply))
-
-user.chat_used+=1
-
-db.commit()
-
-
-
-return {
-
-"reply":reply,
-
-"image":image_path
-
-}
-
-
-
-
-# POSTER
-
-@app.post("/ai/poster")
-
-async def poster(
-
-title:str=Form(...),
-
-user:User=Depends(get_current_user),
-
-db:Session=Depends(get_db)
-
-):
-
-
-img=client.images.generate(
-
-model="gpt-image-1",
-
-prompt=title,
-
-size="1024x1536"
-
-)
-
-
-image_bytes=base64.b64decode(img.data[0].b64_json)
-
-filename=f"{uuid.uuid4()}.png"
-
-path=f"outputs/{filename}"
-
-
-with open(path,"wb") as f:
-
-    f.write(image_bytes)
-
-
-
-user.poster_used+=1
-
-db.commit()
-
-
-
-return {"image":path}
-
-
-
+# ---------------- HEALTH ----------------
 
 @app.get("/health")
-
 def health():
 
-    return {"status":"ok"}
+    return {"status": "ok"}
 
 
+# ---------------- RUN ----------------
 
+if __name__ == "__main__":
 
-if __name__=="__main__":
-
-    uvicorn.run("backendapp:app",host="0.0.0.0",port=8000)
+    uvicorn.run(
+        "backendapp:app",
+        host="0.0.0.0",
+        port=8000
+    )
