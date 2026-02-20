@@ -1,9 +1,9 @@
-from fastapi import FastAPI, HTTPException, Depends, Form, Request, UploadFile, File
+from fastapi import FastAPI, HTTPException, Depends, Form, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 
 from sqlalchemy import Column, Integer, String, create_engine, or_, Text, DateTime
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
@@ -21,33 +21,59 @@ from openai import OpenAI
 import uvicorn
 
 
-# ---------------- CONFIG ----------------
+# ================= CONFIG =================
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("acinyx")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
 DATABASE_URL = os.getenv("DATABASE_URL")
+
 JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_SECRET")
 
 JWT_ALGORITHM = "HS256"
+
 JWT_EXPIRE_DAYS = 30
 
+
+if not DATABASE_URL:
+    raise Exception("DATABASE_URL not set")
+
+
 if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    DATABASE_URL = DATABASE_URL.replace(
+        "postgres://",
+        "postgresql://",
+        1
+    )
+
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 
-# ---------------- DATABASE ----------------
+# ================= DATABASE =================
 
 engine = create_engine(
+
     DATABASE_URL,
+
     pool_pre_ping=True,
+
     pool_recycle=300
+
 )
 
-SessionLocal = sessionmaker(bind=engine)
+SessionLocal = sessionmaker(
+
+    bind=engine,
+
+    autoflush=False,
+
+    autocommit=False
+
+)
+
 Base = declarative_base()
 
 
@@ -55,11 +81,11 @@ class User(Base):
 
     __tablename__ = "users"
 
-    id = Column(Integer, primary_key=True)
+    id = Column(Integer, primary_key=True, index=True)
 
-    username = Column(String, unique=True)
+    username = Column(String, unique=True, index=True)
 
-    email = Column(String, unique=True)
+    email = Column(String, unique=True, index=True)
 
     password_hash = Column(String)
 
@@ -74,7 +100,7 @@ class ChatMemory(Base):
 
     __tablename__ = "chat_memory"
 
-    id = Column(Integer, primary_key=True)
+    id = Column(Integer, primary_key=True, index=True)
 
     user_id = Column(Integer)
 
@@ -88,28 +114,46 @@ class ChatMemory(Base):
 Base.metadata.create_all(bind=engine)
 
 
-# ---------------- APP ----------------
+# ================= APP =================
 
 app = FastAPI()
 
+
 app.add_middleware(
+
     CORSMiddleware,
+
     allow_origins=["*"],
+
     allow_credentials=True,
+
     allow_methods=["*"],
+
     allow_headers=["*"]
+
 )
+
 
 os.makedirs("outputs", exist_ok=True)
 
 app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
 
 
-# ---------------- SECURITY ----------------
+# ================= SECURITY =================
 
 pwd_context = CryptContext(schemes=["bcrypt"])
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+
+def hash_password(password):
+
+    return pwd_context.hash(password)
+
+
+def verify_password(password, hashed):
+
+    return pwd_context.verify(password, hashed)
 
 
 def get_db():
@@ -118,6 +162,7 @@ def get_db():
 
     try:
         yield db
+
     finally:
         db.close()
 
@@ -128,20 +173,35 @@ def create_access_token(data):
 
     data.update({"exp": expire})
 
-    return jwt.encode(data, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return jwt.encode(
+
+        data,
+
+        JWT_SECRET,
+
+        algorithm=JWT_ALGORITHM
+
+    )
 
 
 def get_current_user(
+
     token: str = Depends(oauth2_scheme),
+
     db: Session = Depends(get_db)
+
 ):
 
     try:
 
         payload = jwt.decode(
+
             token,
+
             JWT_SECRET,
+
             algorithms=[JWT_ALGORITHM]
+
         )
 
         username = payload.get("sub")
@@ -150,26 +210,158 @@ def get_current_user(
 
         raise HTTPException(401, "Invalid token")
 
+
     user = db.query(User).filter(
+
         User.username == username
+
     ).first()
 
+
     if not user:
+
         raise HTTPException(401, "Invalid token")
+
 
     return user
 
 
-# ---------------- CHAT ----------------
+# ================= SIGNUP =================
+
+class SignupRequest(BaseModel):
+
+    username: str
+
+    email: EmailStr
+
+    password: str
+
+
+@app.post("/signup")
+
+def signup(
+
+    data: SignupRequest,
+
+    db: Session = Depends(get_db)
+
+):
+
+    existing = db.query(User).filter(
+
+        or_(
+
+            User.username == data.username,
+
+            User.email == data.email
+
+        )
+
+    ).first()
+
+
+    if existing:
+
+        raise HTTPException(
+
+            400,
+
+            "Username or email already exists"
+
+        )
+
+
+    user = User(
+
+        username=data.username,
+
+        email=data.email,
+
+        password_hash=hash_password(data.password)
+
+    )
+
+
+    db.add(user)
+
+    db.commit()
+
+
+    return {
+
+        "message": "Account created"
+
+    }
+
+
+# ================= LOGIN =================
+
+@app.post("/token")
+
+def login(
+
+    form: OAuth2PasswordRequestForm = Depends(),
+
+    db: Session = Depends(get_db)
+
+):
+
+    user = db.query(User).filter(
+
+        or_(
+
+            User.username == form.username,
+
+            User.email == form.username
+
+        )
+
+    ).first()
+
+
+    if not user:
+
+        raise HTTPException(401, "Invalid login")
+
+
+    if not verify_password(
+
+        form.password,
+
+        user.password_hash
+
+    ):
+
+        raise HTTPException(401, "Invalid login")
+
+
+    token = create_access_token(
+
+        {"sub": user.username}
+
+    )
+
+
+    return {
+
+        "access_token": token,
+
+        "token_type": "bearer",
+
+        "plan": user.plan
+
+    }
+
+
+# ================= CHAT =================
 
 @app.post("/ai/chat")
+
 async def chat(
 
     message: str = Form(""),
 
     mode: str = Form("chat"),
-
-    image: UploadFile | None = File(None),
 
     user: User = Depends(get_current_user),
 
@@ -220,7 +412,7 @@ async def chat(
         image_path = path
 
 
-    # HUMANIZE MODE
+    # HUMANIZER MODE
 
     elif mode == "humanize":
 
@@ -235,6 +427,7 @@ async def chat(
                     "role": "system",
 
                     "content":
+
                     "Rewrite this text to sound natural and human."
 
                 },
@@ -279,8 +472,6 @@ async def chat(
         reply = res.choices[0].message.content
 
 
-    # SAVE
-
     db.add(ChatMemory(
 
         user_id=user.id,
@@ -290,6 +481,7 @@ async def chat(
         content=message
 
     ))
+
 
     db.add(ChatMemory(
 
@@ -301,7 +493,9 @@ async def chat(
 
     ))
 
+
     user.chat_used += 1
+
 
     db.commit()
 
@@ -315,9 +509,10 @@ async def chat(
     }
 
 
-# ---------------- POSTER ----------------
+# ================= POSTER =================
 
 @app.post("/ai/poster")
+
 async def poster(
 
     title: str = Form(...),
@@ -327,6 +522,11 @@ async def poster(
     db: Session = Depends(get_db)
 
 ):
+
+    if user.poster_used >= 50:
+
+        raise HTTPException(403, "Poster limit reached")
+
 
     img = client.images.generate(
 
@@ -338,41 +538,59 @@ async def poster(
 
     )
 
+
     image_bytes = base64.b64decode(
 
         img.data[0].b64_json
 
     )
 
+
     filename = f"{uuid.uuid4()}.png"
 
     path = f"outputs/{filename}"
+
 
     with open(path, "wb") as f:
 
         f.write(image_bytes)
 
+
     user.poster_used += 1
 
     db.commit()
 
-    return {"image": path}
+
+    return {
+
+        "image": path
+
+    }
 
 
-# ---------------- HEALTH ----------------
+# ================= HEALTH =================
 
 @app.get("/health")
+
 def health():
 
-    return {"status": "ok"}
+    return {
+
+        "status": "ok"
+
+    }
 
 
-# ---------------- RUN ----------------
+# ================= RUN =================
 
 if __name__ == "__main__":
 
     uvicorn.run(
+
         "backendapp:app",
+
         host="0.0.0.0",
+
         port=8000
+
     )
