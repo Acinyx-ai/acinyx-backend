@@ -5,7 +5,7 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 
 from pydantic import BaseModel, EmailStr
 
-from sqlalchemy import Column, Integer, String, create_engine, or_, Text, DateTime
+from sqlalchemy import Column, Integer, String, create_engine, or_, Text, DateTime, func
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 from passlib.context import CryptContext
@@ -27,14 +27,13 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("acinyx")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_SECRET")
-
 JWT_ALGORITHM = "HS256"
-
 JWT_EXPIRE_DAYS = 30
+
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
 
 
 if not DATABASE_URL:
@@ -55,27 +54,21 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # ================= DATABASE =================
 
 engine = create_engine(
-
     DATABASE_URL,
-
     pool_pre_ping=True,
-
     pool_recycle=300
-
 )
 
 SessionLocal = sessionmaker(
-
     bind=engine,
-
     autoflush=False,
-
     autocommit=False
-
 )
 
 Base = declarative_base()
 
+
+# ================= MODELS =================
 
 class User(Base):
 
@@ -353,6 +346,81 @@ def login(
     }
 
 
+# ================= ADMIN DASHBOARD =================
+
+@app.get("/admin/data")
+
+def admin_data(
+
+    user: User = Depends(get_current_user),
+
+    db: Session = Depends(get_db)
+
+):
+
+    if user.email != ADMIN_EMAIL:
+
+        raise HTTPException(403, "Not authorized")
+
+
+    total_users = db.query(func.count(User.id)).scalar()
+
+    total_messages = db.query(func.count(ChatMemory.id)).scalar()
+
+    active_users = db.query(
+
+        func.count(func.distinct(ChatMemory.user_id))
+
+    ).scalar()
+
+
+    paid_users = db.query(func.count(User.id)).filter(
+
+        User.plan != "free"
+
+    ).scalar()
+
+
+    revenue = paid_users * 5
+
+
+    usage = db.query(
+
+        func.date(ChatMemory.created_at),
+
+        func.count(ChatMemory.id)
+
+    ).group_by(
+
+        func.date(ChatMemory.created_at)
+
+    ).all()
+
+
+    usage_data = [
+
+        {"date": str(u[0]), "count": u[1]}
+
+        for u in usage
+
+    ]
+
+
+    return {
+
+        "total_users": total_users,
+
+        "active_users": active_users,
+
+        "total_messages": total_messages,
+
+        "revenue": revenue,
+
+        "usage": usage_data
+
+    }
+
+
 # ================= CHAT =================
 
 @app.post("/ai/chat")
@@ -378,8 +446,6 @@ async def chat(
 
     image_path = None
 
-
-    # IMAGE MODE
 
     if mode == "image":
 
@@ -412,8 +478,6 @@ async def chat(
         image_path = path
 
 
-    # HUMANIZER MODE
-
     elif mode == "humanize":
 
         res = client.chat.completions.create(
@@ -422,23 +486,11 @@ async def chat(
 
             messages=[
 
-                {
+                {"role": "system",
 
-                    "role": "system",
+                 "content": "Rewrite this text to sound natural and human."},
 
-                    "content":
-
-                    "Rewrite this text to sound natural and human."
-
-                },
-
-                {
-
-                    "role": "user",
-
-                    "content": message
-
-                }
+                {"role": "user", "content": message}
 
             ]
 
@@ -446,8 +498,6 @@ async def chat(
 
         reply = res.choices[0].message.content
 
-
-    # NORMAL CHAT
 
     else:
 
@@ -457,13 +507,7 @@ async def chat(
 
             messages=[
 
-                {
-
-                    "role": "user",
-
-                    "content": message
-
-                }
+                {"role": "user", "content": message}
 
             ]
 
@@ -472,30 +516,11 @@ async def chat(
         reply = res.choices[0].message.content
 
 
-    db.add(ChatMemory(
+    db.add(ChatMemory(user_id=user.id, role="user", content=message))
 
-        user_id=user.id,
-
-        role="user",
-
-        content=message
-
-    ))
-
-
-    db.add(ChatMemory(
-
-        user_id=user.id,
-
-        role="assistant",
-
-        content=reply
-
-    ))
-
+    db.add(ChatMemory(user_id=user.id, role="assistant", content=reply))
 
     user.chat_used += 1
-
 
     db.commit()
 
