@@ -32,7 +32,6 @@ import uvicorn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("acinyx")
 
-
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET")
@@ -45,12 +44,14 @@ JWT_EXPIRE_DAYS = 30
 if not DATABASE_URL:
     raise Exception("DATABASE_URL not set")
 
+
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace(
         "postgres://",
         "postgresql://",
         1
     )
+
 
 if not OPENAI_API_KEY:
     logger.warning("OPENAI_API_KEY not set")
@@ -66,13 +67,29 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 PLAN_LIMITS = {
 
-    "free": {"chat": 20, "poster": 3},
+    "free": {
+        "chat": 20,
+        "poster": 3,
+        "humanize": 20
+    },
 
-    "basic": {"chat": -1, "poster": 50},
+    "basic": {
+        "chat": -1,
+        "poster": 50,
+        "humanize": 100
+    },
 
-    "pro": {"chat": -1, "poster": 200},
+    "pro": {
+        "chat": -1,
+        "poster": 200,
+        "humanize": -1
+    },
 
-    "mega": {"chat": -1, "poster": -1},
+    "mega": {
+        "chat": -1,
+        "poster": -1,
+        "humanize": -1
+    }
 
 }
 
@@ -114,6 +131,7 @@ class User(Base):
 
     poster_used = Column(Integer, default=0)
 
+    humanize_used = Column(Integer, default=0)
 
 
 class ChatMemory(Base):
@@ -129,7 +147,6 @@ class ChatMemory(Base):
     content = Column(Text)
 
     created_at = Column(DateTime, default=datetime.utcnow)
-
 
 
 Base.metadata.create_all(bind=engine)
@@ -181,11 +198,9 @@ def get_db():
     db = SessionLocal()
 
     try:
-
         yield db
 
     finally:
-
         db.close()
 
 
@@ -195,7 +210,11 @@ def create_access_token(data):
 
     data.update({"exp": expire})
 
-    return jwt.encode(data, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return jwt.encode(
+        data,
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM
+    )
 
 
 def get_current_user(
@@ -209,13 +228,9 @@ def get_current_user(
     try:
 
         payload = jwt.decode(
-
             token,
-
             JWT_SECRET,
-
             algorithms=[JWT_ALGORITHM]
-
         )
 
         username = payload.get("sub")
@@ -224,18 +239,13 @@ def get_current_user(
 
         raise HTTPException(401, "Invalid token")
 
-
     user = db.query(User).filter(
-
         User.username == username
-
     ).first()
-
 
     if not user:
 
         raise HTTPException(401, "Invalid token")
-
 
     return user
 
@@ -245,7 +255,9 @@ def get_current_user(
 class SignupRequest(BaseModel):
 
     username: str
+
     email: EmailStr
+
     password: str
 
 
@@ -265,11 +277,9 @@ def signup(data: SignupRequest, db: Session = Depends(get_db)):
 
     ).first()
 
-
     if existing:
 
         raise HTTPException(400, "User exists")
-
 
     user = User(
 
@@ -280,7 +290,6 @@ def signup(data: SignupRequest, db: Session = Depends(get_db)):
         password_hash=hash_password(data.password)
 
     )
-
 
     db.add(user)
 
@@ -293,7 +302,9 @@ def signup(data: SignupRequest, db: Session = Depends(get_db)):
 
 @app.post("/token")
 
-def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+def login(form: OAuth2PasswordRequestForm = Depends(),
+
+          db: Session = Depends(get_db)):
 
     user = db.query(User).filter(
 
@@ -307,11 +318,9 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
 
     ).first()
 
-
     if not user:
 
         raise HTTPException(401, "Invalid login")
-
 
     if not verify_password(
 
@@ -323,13 +332,11 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
 
         raise HTTPException(401, "Invalid login")
 
-
     token = create_access_token(
 
         {"sub": user.username}
 
     )
-
 
     return {
 
@@ -347,194 +354,200 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
 class PaystackRequest(BaseModel):
 
     plan: str
+
     amount: int
 
 
 @app.post("/payments/paystack/init")
 
-def paystack_init(
+def paystack_init(data: PaystackRequest,
 
-    data: PaystackRequest,
+                  user: User = Depends(get_current_user)):
 
-    user: User = Depends(get_current_user)
+    if not PAYSTACK_SECRET:
 
-):
+        raise HTTPException(500, "Payment not configured")
 
-    try:
+    headers = {
 
-        if not PAYSTACK_SECRET:
+        "Authorization": f"Bearer {PAYSTACK_SECRET}",
 
-            raise HTTPException(500, "Payment not configured")
+        "Content-Type": "application/json"
 
+    }
 
-        headers = {
+    payload = {
 
-            "Authorization": f"Bearer {PAYSTACK_SECRET}",
+        "email": user.email,
 
-            "Content-Type": "application/json"
+        "amount": data.amount,
 
-        }
+        "metadata": {
 
-
-        payload = {
-
-            "email": user.email,
-
-            "amount": data.amount,
-
-            "metadata": {
-
-                "plan": data.plan
-
-            }
+            "plan": data.plan
 
         }
 
+    }
 
-        response = requests.post(
+    response = requests.post(
 
-            "https://api.paystack.co/transaction/initialize",
+        "https://api.paystack.co/transaction/initialize",
 
-            json=payload,
+        json=payload,
 
-            headers=headers,
+        headers=headers
 
-            timeout=30
+    )
 
-        )
+    result = response.json()
 
+    if not result.get("status"):
 
-        result = response.json()
+        raise HTTPException(400, result.get("message"))
 
+    return {
 
-        if not result.get("status"):
+        "authorization_url":
 
-            raise HTTPException(
+        result["data"]["authorization_url"]
 
-                400,
-
-                result.get("message")
-
-            )
-
-
-        return {
-
-            "authorization_url":
-
-            result["data"]["authorization_url"]
-
-        }
-
-
-    except Exception as e:
-
-        logger.error(f"PAYSTACK ERROR: {str(e)}")
-
-        raise HTTPException(
-
-            500,
-
-            "Payment initialization failed"
-
-        )
+    }
 
 
 # ================= CHAT =================
 
 @app.post("/ai/chat")
 
-async def chat(
+async def chat(message: str = Form(...),
 
-    message: str = Form(""),
+               user: User = Depends(get_current_user),
 
-    user: User = Depends(get_current_user),
+               db: Session = Depends(get_db)):
 
-    db: Session = Depends(get_db)
+    limits = PLAN_LIMITS[user.plan]
 
-):
+    if limits["chat"] != -1 and user.chat_used >= limits["chat"]:
 
-    try:
+        raise HTTPException(403, "Chat limit reached")
 
-        limits = PLAN_LIMITS[user.plan]
+    response = client.chat.completions.create(
 
+        model="gpt-4.1-mini",
 
-        if limits["chat"] != -1 and user.chat_used >= limits["chat"]:
+        messages=[
 
-            raise HTTPException(403, "Chat limit reached")
+            {"role": "user", "content": message}
 
+        ]
 
-        if not OPENAI_API_KEY:
+    )
 
-            raise HTTPException(500, "AI not configured")
+    reply = response.choices[0].message.content
 
+    user.chat_used += 1
 
-        response = client.chat.completions.create(
+    db.commit()
 
-            model="gpt-4.1-mini",
-
-            messages=[
-
-                {
-
-                    "role": "user",
-
-                    "content": message
-
-                }
-
-            ]
-
-        )
+    return {"reply": reply}
 
 
-        reply = response.choices[0].message.content
+# ================= HUMANISER =================
+
+@app.post("/ai/humanize")
+
+async def humanize(message: str = Form(...),
+
+                   user: User = Depends(get_current_user),
+
+                   db: Session = Depends(get_db)):
+
+    limits = PLAN_LIMITS[user.plan]
+
+    if limits["humanize"] != -1 and user.humanize_used >= limits["humanize"]:
+
+        raise HTTPException(403, "Humanize limit reached")
+
+    response = client.chat.completions.create(
+
+        model="gpt-4.1-mini",
+
+        messages=[
+
+            {
+
+                "role": "system",
+
+                "content": "Rewrite this text naturally and human-like."
+
+            },
+
+            {
+
+                "role": "user",
+
+                "content": message
+
+            }
+
+        ]
+
+    )
+
+    reply = response.choices[0].message.content
+
+    user.humanize_used += 1
+
+    db.commit()
+
+    return {"reply": reply}
 
 
-        user.chat_used += 1
+# ================= POSTER =================
 
+@app.post("/ai/poster")
 
-        db.add(
+async def poster(title: str = Form(...),
 
-            ChatMemory(
+                 user: User = Depends(get_current_user),
 
-                user_id=user.id,
+                 db: Session = Depends(get_db)):
 
-                role="assistant",
+    limits = PLAN_LIMITS[user.plan]
 
-                content=reply
+    if limits["poster"] != -1 and user.poster_used >= limits["poster"]:
 
-            )
+        raise HTTPException(403, "Poster limit reached")
 
-        )
+    img = client.images.generate(
 
+        model="gpt-image-1",
 
-        db.commit()
+        prompt=title,
 
+        size="1024x1536"
 
-        return {
+    )
 
-            "reply": reply
+    image_bytes = base64.b64decode(
 
-        }
+        img.data[0].b64_json
 
+    )
 
-    except HTTPException:
+    filename = f"{uuid.uuid4()}.png"
 
-        raise
+    path = f"outputs/{filename}"
 
+    with open(path, "wb") as f:
 
-    except Exception as e:
+        f.write(image_bytes)
 
-        logger.error(f"OPENAI ERROR: {str(e)}")
+    user.poster_used += 1
 
-        raise HTTPException(
+    db.commit()
 
-            500,
-
-            "AI server error"
-
-        )
+    return {"image": path}
 
 
 # ================= HEALTH =================
@@ -543,11 +556,7 @@ async def chat(
 
 def health():
 
-    return {
-
-        "status": "ok"
-
-    }
+    return {"status": "ok"}
 
 
 # ================= RUN =================
