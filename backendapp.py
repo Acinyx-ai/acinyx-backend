@@ -32,6 +32,7 @@ import uvicorn
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("acinyx")
 
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 PAYSTACK_SECRET = os.getenv("PAYSTACK_SECRET")
@@ -40,15 +41,9 @@ JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_SECRET")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_DAYS = 30
 
-ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
-
 
 if not DATABASE_URL:
     raise Exception("DATABASE_URL not set")
-
-if not PAYSTACK_SECRET:
-    raise Exception("PAYSTACK_SECRET not set")
-
 
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace(
@@ -56,6 +51,12 @@ if DATABASE_URL.startswith("postgres://"):
         "postgresql://",
         1
     )
+
+if not OPENAI_API_KEY:
+    logger.warning("OPENAI_API_KEY not set")
+
+if not PAYSTACK_SECRET:
+    logger.warning("PAYSTACK_SECRET not set")
 
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -84,7 +85,11 @@ engine = create_engine(
     pool_recycle=300
 )
 
-SessionLocal = sessionmaker(bind=engine)
+SessionLocal = sessionmaker(
+    bind=engine,
+    autoflush=False,
+    autocommit=False
+)
 
 Base = declarative_base()
 
@@ -134,7 +139,6 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
-
 app.add_middleware(
 
     CORSMiddleware,
@@ -172,7 +176,6 @@ def verify_password(password, hashed):
     return pwd_context.verify(password, hashed)
 
 
-
 def get_db():
 
     db = SessionLocal()
@@ -186,7 +189,6 @@ def get_db():
         db.close()
 
 
-
 def create_access_token(data):
 
     expire = datetime.utcnow() + timedelta(days=JWT_EXPIRE_DAYS)
@@ -194,7 +196,6 @@ def create_access_token(data):
     data.update({"exp": expire})
 
     return jwt.encode(data, JWT_SECRET, algorithm=JWT_ALGORITHM)
-
 
 
 def get_current_user(
@@ -239,7 +240,6 @@ def get_current_user(
     return user
 
 
-
 # ================= SIGNUP =================
 
 class SignupRequest(BaseModel):
@@ -251,13 +251,7 @@ class SignupRequest(BaseModel):
 
 @app.post("/signup")
 
-def signup(
-
-    data: SignupRequest,
-
-    db: Session = Depends(get_db)
-
-):
+def signup(data: SignupRequest, db: Session = Depends(get_db)):
 
     existing = db.query(User).filter(
 
@@ -292,22 +286,14 @@ def signup(
 
     db.commit()
 
-
     return {"message": "Account created"}
-
 
 
 # ================= LOGIN =================
 
 @app.post("/token")
 
-def login(
-
-    form: OAuth2PasswordRequestForm = Depends(),
-
-    db: Session = Depends(get_db)
-
-):
+def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
 
     user = db.query(User).filter(
 
@@ -356,14 +342,12 @@ def login(
     }
 
 
-
-# ================= PAYSTACK INIT =================
+# ================= PAYSTACK =================
 
 class PaystackRequest(BaseModel):
 
     plan: str
     amount: int
-
 
 
 @app.post("/payments/paystack/init")
@@ -377,6 +361,11 @@ def paystack_init(
 ):
 
     try:
+
+        if not PAYSTACK_SECRET:
+
+            raise HTTPException(500, "Payment not configured")
+
 
         headers = {
 
@@ -395,9 +384,7 @@ def paystack_init(
 
             "metadata": {
 
-                "plan": data.plan,
-
-                "username": user.username
+                "plan": data.plan
 
             }
 
@@ -420,13 +407,13 @@ def paystack_init(
         result = response.json()
 
 
-        if not result["status"]:
+        if not result.get("status"):
 
             raise HTTPException(
 
                 400,
 
-                result["message"]
+                result.get("message")
 
             )
 
@@ -442,7 +429,7 @@ def paystack_init(
 
     except Exception as e:
 
-        logger.error(str(e))
+        logger.error(f"PAYSTACK ERROR: {str(e)}")
 
         raise HTTPException(
 
@@ -451,7 +438,6 @@ def paystack_init(
             "Payment initialization failed"
 
         )
-
 
 
 # ================= CHAT =================
@@ -468,113 +454,87 @@ async def chat(
 
 ):
 
-    limits = PLAN_LIMITS[user.plan]
+    try:
+
+        limits = PLAN_LIMITS[user.plan]
 
 
-    if limits["chat"] != -1 and user.chat_used >= limits["chat"]:
+        if limits["chat"] != -1 and user.chat_used >= limits["chat"]:
 
-        raise HTTPException(403, "Chat limit reached")
-
-
-    res = client.chat.completions.create(
-
-        model="gpt-4.1-mini",
-
-        messages=[
-
-            {"role": "user", "content": message}
-
-        ]
-
-    )
+            raise HTTPException(403, "Chat limit reached")
 
 
-    reply = res.choices[0].message.content
+        if not OPENAI_API_KEY:
+
+            raise HTTPException(500, "AI not configured")
 
 
-    user.chat_used += 1
+        response = client.chat.completions.create(
 
+            model="gpt-4.1-mini",
 
-    db.add(
+            messages=[
 
-        ChatMemory(
+                {
 
-            user_id=user.id,
+                    "role": "user",
 
-            role="assistant",
+                    "content": message
 
-            content=reply
+                }
+
+            ]
 
         )
 
-    )
+
+        reply = response.choices[0].message.content
 
 
-    db.commit()
+        user.chat_used += 1
 
 
-    return {"reply": reply}
+        db.add(
+
+            ChatMemory(
+
+                user_id=user.id,
+
+                role="assistant",
+
+                content=reply
+
+            )
+
+        )
 
 
-
-# ================= POSTER =================
-
-@app.post("/ai/poster")
-
-async def poster(
-
-    title: str = Form(...),
-
-    user: User = Depends(get_current_user),
-
-    db: Session = Depends(get_db)
-
-):
-
-    limits = PLAN_LIMITS[user.plan]
+        db.commit()
 
 
-    if limits["poster"] != -1 and user.poster_used >= limits["poster"]:
+        return {
 
-        raise HTTPException(403, "Poster limit reached")
+            "reply": reply
 
-
-    img = client.images.generate(
-
-        model="gpt-image-1",
-
-        prompt=title,
-
-        size="1024x1536"
-
-    )
+        }
 
 
-    image_bytes = base64.b64decode(
+    except HTTPException:
 
-        img.data[0].b64_json
-
-    )
+        raise
 
 
-    filename = f"{uuid.uuid4()}.png"
+    except Exception as e:
 
-    path = f"outputs/{filename}"
+        logger.error(f"OPENAI ERROR: {str(e)}")
 
+        raise HTTPException(
 
-    with open(path, "wb") as f:
+            500,
 
-        f.write(image_bytes)
+            "AI server error"
 
-
-    user.poster_used += 1
-
-
-    db.commit()
-
-
-    return {"image": path}
-
+        )
 
 
 # ================= HEALTH =================
@@ -583,8 +543,11 @@ async def poster(
 
 def health():
 
-    return {"status": "ok"}
+    return {
 
+        "status": "ok"
+
+    }
 
 
 # ================= RUN =================
