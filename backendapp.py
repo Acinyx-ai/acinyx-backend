@@ -1,3 +1,5 @@
+# ================= IMPORTS =================
+
 from fastapi import FastAPI, HTTPException, Depends, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -5,7 +7,7 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 
 from pydantic import BaseModel, EmailStr
 
-from sqlalchemy import Column, Integer, String, create_engine, or_, Text, DateTime, func
+from sqlalchemy import Column, Integer, String, create_engine, or_, Text, DateTime
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 from passlib.context import CryptContext
@@ -44,9 +46,16 @@ ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
 if not DATABASE_URL:
     raise Exception("DATABASE_URL not set")
 
+if not PAYSTACK_SECRET:
+    raise Exception("PAYSTACK_SECRET not set")
+
 
 if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    DATABASE_URL = DATABASE_URL.replace(
+        "postgres://",
+        "postgresql://",
+        1
+    )
 
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -56,42 +65,13 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 PLAN_LIMITS = {
 
-    "free": {
-        "chat": 20,
-        "poster": 3,
-        "image": 3,
-        "humanize": 20,
-    },
+    "free": {"chat": 20, "poster": 3},
 
-    "basic": {
-        "chat": -1,
-        "poster": 50,
-        "image": 50,
-        "humanize": 100,
-    },
+    "basic": {"chat": -1, "poster": 50},
 
-    "pro": {
-        "chat": -1,
-        "poster": 200,
-        "image": 200,
-        "humanize": -1,
-    },
+    "pro": {"chat": -1, "poster": 200},
 
-    "mega": {
-        "chat": -1,
-        "poster": -1,
-        "image": -1,
-        "humanize": -1,
-    }
-
-}
-
-
-PLAN_PRICES = {
-
-    "basic": 250,
-    "pro": 500,
-    "mega": 1500
+    "mega": {"chat": -1, "poster": -1},
 
 }
 
@@ -129,9 +109,6 @@ class User(Base):
 
     poster_used = Column(Integer, default=0)
 
-    image_used = Column(Integer, default=0)
-
-    humanize_used = Column(Integer, default=0)
 
 
 class ChatMemory(Base):
@@ -147,6 +124,7 @@ class ChatMemory(Base):
     content = Column(Text)
 
     created_at = Column(DateTime, default=datetime.utcnow)
+
 
 
 Base.metadata.create_all(bind=engine)
@@ -194,15 +172,19 @@ def verify_password(password, hashed):
     return pwd_context.verify(password, hashed)
 
 
+
 def get_db():
 
     db = SessionLocal()
 
     try:
+
         yield db
 
     finally:
+
         db.close()
+
 
 
 def create_access_token(data):
@@ -212,6 +194,7 @@ def create_access_token(data):
     data.update({"exp": expire})
 
     return jwt.encode(data, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
 
 
 def get_current_user(
@@ -240,17 +223,21 @@ def get_current_user(
 
         raise HTTPException(401, "Invalid token")
 
+
     user = db.query(User).filter(
 
         User.username == username
 
     ).first()
 
+
     if not user:
 
         raise HTTPException(401, "Invalid token")
 
+
     return user
+
 
 
 # ================= SIGNUP =================
@@ -264,7 +251,13 @@ class SignupRequest(BaseModel):
 
 @app.post("/signup")
 
-def signup(data: SignupRequest, db: Session = Depends(get_db)):
+def signup(
+
+    data: SignupRequest,
+
+    db: Session = Depends(get_db)
+
+):
 
     existing = db.query(User).filter(
 
@@ -278,9 +271,11 @@ def signup(data: SignupRequest, db: Session = Depends(get_db)):
 
     ).first()
 
+
     if existing:
 
         raise HTTPException(400, "User exists")
+
 
     user = User(
 
@@ -292,11 +287,14 @@ def signup(data: SignupRequest, db: Session = Depends(get_db)):
 
     )
 
+
     db.add(user)
 
     db.commit()
 
+
     return {"message": "Account created"}
+
 
 
 # ================= LOGIN =================
@@ -323,9 +321,11 @@ def login(
 
     ).first()
 
+
     if not user:
 
         raise HTTPException(401, "Invalid login")
+
 
     if not verify_password(
 
@@ -337,11 +337,13 @@ def login(
 
         raise HTTPException(401, "Invalid login")
 
+
     token = create_access_token(
 
         {"sub": user.username}
 
     )
+
 
     return {
 
@@ -354,12 +356,14 @@ def login(
     }
 
 
-# ================= PAYSTACK PAYMENT =================
+
+# ================= PAYSTACK INIT =================
 
 class PaystackRequest(BaseModel):
 
     plan: str
     amount: int
+
 
 
 @app.post("/payments/paystack/init")
@@ -368,63 +372,86 @@ def paystack_init(
 
     data: PaystackRequest,
 
-    user: User = Depends(get_current_user),
-
-    db: Session = Depends(get_db)
+    user: User = Depends(get_current_user)
 
 ):
 
-    headers = {
+    try:
 
-        "Authorization": f"Bearer {PAYSTACK_SECRET}",
+        headers = {
 
-        "Content-Type": "application/json"
+            "Authorization": f"Bearer {PAYSTACK_SECRET}",
 
-    }
-
-    payload = {
-
-        "email": user.email,
-
-        "amount": data.amount,
-
-        "metadata": {
-
-            "plan": data.plan
+            "Content-Type": "application/json"
 
         }
 
-    }
 
-    response = requests.post(
+        payload = {
 
-        "https://api.paystack.co/transaction/initialize",
+            "email": user.email,
 
-        json=payload,
+            "amount": data.amount,
 
-        headers=headers
+            "metadata": {
 
-    )
+                "plan": data.plan,
 
-    result = response.json()
+                "username": user.username
 
-    if not result.get("status"):
+            }
 
-        raise HTTPException(400, result.get("message"))
+        }
 
-    # upgrade plan immediately
 
-    user.plan = data.plan
+        response = requests.post(
 
-    db.commit()
+            "https://api.paystack.co/transaction/initialize",
 
-    return {
+            json=payload,
 
-        "authorization_url":
+            headers=headers,
 
-        result["data"]["authorization_url"]
+            timeout=30
 
-    }
+        )
+
+
+        result = response.json()
+
+
+        if not result["status"]:
+
+            raise HTTPException(
+
+                400,
+
+                result["message"]
+
+            )
+
+
+        return {
+
+            "authorization_url":
+
+            result["data"]["authorization_url"]
+
+        }
+
+
+    except Exception as e:
+
+        logger.error(str(e))
+
+        raise HTTPException(
+
+            500,
+
+            "Payment initialization failed"
+
+        )
+
 
 
 # ================= CHAT =================
@@ -435,8 +462,6 @@ async def chat(
 
     message: str = Form(""),
 
-    mode: str = Form("chat"),
-
     user: User = Depends(get_current_user),
 
     db: Session = Depends(get_db)
@@ -445,9 +470,11 @@ async def chat(
 
     limits = PLAN_LIMITS[user.plan]
 
+
     if limits["chat"] != -1 and user.chat_used >= limits["chat"]:
 
         raise HTTPException(403, "Chat limit reached")
+
 
     res = client.chat.completions.create(
 
@@ -461,13 +488,33 @@ async def chat(
 
     )
 
+
     reply = res.choices[0].message.content
+
 
     user.chat_used += 1
 
+
+    db.add(
+
+        ChatMemory(
+
+            user_id=user.id,
+
+            role="assistant",
+
+            content=reply
+
+        )
+
+    )
+
+
     db.commit()
 
+
     return {"reply": reply}
+
 
 
 # ================= POSTER =================
@@ -486,9 +533,11 @@ async def poster(
 
     limits = PLAN_LIMITS[user.plan]
 
+
     if limits["poster"] != -1 and user.poster_used >= limits["poster"]:
 
         raise HTTPException(403, "Poster limit reached")
+
 
     img = client.images.generate(
 
@@ -500,25 +549,32 @@ async def poster(
 
     )
 
+
     image_bytes = base64.b64decode(
 
         img.data[0].b64_json
 
     )
 
+
     filename = f"{uuid.uuid4()}.png"
 
     path = f"outputs/{filename}"
+
 
     with open(path, "wb") as f:
 
         f.write(image_bytes)
 
+
     user.poster_used += 1
+
 
     db.commit()
 
+
     return {"image": path}
+
 
 
 # ================= HEALTH =================
@@ -528,6 +584,7 @@ async def poster(
 def health():
 
     return {"status": "ok"}
+
 
 
 # ================= RUN =================
