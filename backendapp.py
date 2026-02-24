@@ -27,10 +27,13 @@ from openai import OpenAI
 import uvicorn
 
 
-# ================= CONFIG =================
+# ================= LOGGING =================
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("acinyx")
+
+
+# ================= CONFIG =================
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -56,6 +59,7 @@ if DATABASE_URL.startswith("postgres://"):
 if not OPENAI_API_KEY:
     logger.warning("OPENAI_API_KEY not set")
 
+
 if not PAYSTACK_SECRET:
     logger.warning("PAYSTACK_SECRET not set")
 
@@ -70,25 +74,29 @@ PLAN_LIMITS = {
     "free": {
         "chat": 20,
         "poster": 3,
-        "humanize": 20
+        "humanize": 20,
+        "image": 3
     },
 
     "basic": {
         "chat": -1,
         "poster": 50,
-        "humanize": 100
+        "humanize": 100,
+        "image": 50
     },
 
     "pro": {
         "chat": -1,
         "poster": 200,
-        "humanize": -1
+        "humanize": -1,
+        "image": 200
     },
 
     "mega": {
         "chat": -1,
         "poster": -1,
-        "humanize": -1
+        "humanize": -1,
+        "image": -1
     }
 
 }
@@ -133,20 +141,7 @@ class User(Base):
 
     humanize_used = Column(Integer, default=0)
 
-
-class ChatMemory(Base):
-
-    __tablename__ = "chat_memory"
-
-    id = Column(Integer, primary_key=True)
-
-    user_id = Column(Integer)
-
-    role = Column(String)
-
-    content = Column(Text)
-
-    created_at = Column(DateTime, default=datetime.utcnow)
+    image_used = Column(Integer, default=0)
 
 
 Base.metadata.create_all(bind=engine)
@@ -183,6 +178,16 @@ pwd_context = CryptContext(schemes=["bcrypt"])
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 
+def get_db():
+
+    db = SessionLocal()
+
+    try:
+        yield db
+    finally:
+        db.close()
+
+
 def hash_password(password):
 
     return pwd_context.hash(password)
@@ -191,17 +196,6 @@ def hash_password(password):
 def verify_password(password, hashed):
 
     return pwd_context.verify(password, hashed)
-
-
-def get_db():
-
-    db = SessionLocal()
-
-    try:
-        yield db
-
-    finally:
-        db.close()
 
 
 def create_access_token(data):
@@ -219,18 +213,22 @@ def create_access_token(data):
 
 def get_current_user(
 
-    token: str = Depends(oauth2_scheme),
+        token: str = Depends(oauth2_scheme),
 
-    db: Session = Depends(get_db)
+        db: Session = Depends(get_db)
 
 ):
 
     try:
 
         payload = jwt.decode(
+
             token,
+
             JWT_SECRET,
+
             algorithms=[JWT_ALGORITHM]
+
         )
 
         username = payload.get("sub")
@@ -240,12 +238,14 @@ def get_current_user(
         raise HTTPException(401, "Invalid token")
 
     user = db.query(User).filter(
+
         User.username == username
+
     ).first()
 
     if not user:
 
-        raise HTTPException(401, "Invalid token")
+        raise HTTPException(401, "User not found")
 
     return user
 
@@ -263,7 +263,13 @@ class SignupRequest(BaseModel):
 
 @app.post("/signup")
 
-def signup(data: SignupRequest, db: Session = Depends(get_db)):
+def signup(
+
+        data: SignupRequest,
+
+        db: Session = Depends(get_db)
+
+):
 
     existing = db.query(User).filter(
 
@@ -279,7 +285,7 @@ def signup(data: SignupRequest, db: Session = Depends(get_db)):
 
     if existing:
 
-        raise HTTPException(400, "User exists")
+        raise HTTPException(400, "User already exists")
 
     user = User(
 
@@ -302,9 +308,13 @@ def signup(data: SignupRequest, db: Session = Depends(get_db)):
 
 @app.post("/token")
 
-def login(form: OAuth2PasswordRequestForm = Depends(),
+def login(
 
-          db: Session = Depends(get_db)):
+        form: OAuth2PasswordRequestForm = Depends(),
+
+        db: Session = Depends(get_db)
+
+):
 
     user = db.query(User).filter(
 
@@ -324,9 +334,9 @@ def login(form: OAuth2PasswordRequestForm = Depends(),
 
     if not verify_password(
 
-        form.password,
+            form.password,
 
-        user.password_hash
+            user.password_hash
 
     ):
 
@@ -360,9 +370,13 @@ class PaystackRequest(BaseModel):
 
 @app.post("/payments/paystack/init")
 
-def paystack_init(data: PaystackRequest,
+def paystack(
 
-                  user: User = Depends(get_current_user)):
+        data: PaystackRequest,
+
+        user: User = Depends(get_current_user)
+
+):
 
     if not PAYSTACK_SECRET:
 
@@ -384,7 +398,9 @@ def paystack_init(data: PaystackRequest,
 
         "metadata": {
 
-            "plan": data.plan
+            "plan": data.plan,
+
+            "username": user.username
 
         }
 
@@ -419,11 +435,15 @@ def paystack_init(data: PaystackRequest,
 
 @app.post("/ai/chat")
 
-async def chat(message: str = Form(...),
+async def chat(
 
-               user: User = Depends(get_current_user),
+        message: str = Form(...),
 
-               db: Session = Depends(get_db)):
+        user: User = Depends(get_current_user),
+
+        db: Session = Depends(get_db)
+
+):
 
     limits = PLAN_LIMITS[user.plan]
 
@@ -431,7 +451,7 @@ async def chat(message: str = Form(...),
 
         raise HTTPException(403, "Chat limit reached")
 
-    response = client.chat.completions.create(
+    res = client.chat.completions.create(
 
         model="gpt-4.1-mini",
 
@@ -443,7 +463,7 @@ async def chat(message: str = Form(...),
 
     )
 
-    reply = response.choices[0].message.content
+    reply = res.choices[0].message.content
 
     user.chat_used += 1
 
@@ -456,11 +476,15 @@ async def chat(message: str = Form(...),
 
 @app.post("/ai/humanize")
 
-async def humanize(message: str = Form(...),
+async def humanize(
 
-                   user: User = Depends(get_current_user),
+        message: str = Form(...),
 
-                   db: Session = Depends(get_db)):
+        user: User = Depends(get_current_user),
+
+        db: Session = Depends(get_db)
+
+):
 
     limits = PLAN_LIMITS[user.plan]
 
@@ -468,7 +492,7 @@ async def humanize(message: str = Form(...),
 
         raise HTTPException(403, "Humanize limit reached")
 
-    response = client.chat.completions.create(
+    res = client.chat.completions.create(
 
         model="gpt-4.1-mini",
 
@@ -494,7 +518,7 @@ async def humanize(message: str = Form(...),
 
     )
 
-    reply = response.choices[0].message.content
+    reply = res.choices[0].message.content
 
     user.humanize_used += 1
 
@@ -503,15 +527,70 @@ async def humanize(message: str = Form(...),
     return {"reply": reply}
 
 
+# ================= IMAGE =================
+
+@app.post("/ai/image")
+
+async def image(
+
+        prompt: str = Form(...),
+
+        user: User = Depends(get_current_user),
+
+        db: Session = Depends(get_db)
+
+):
+
+    limits = PLAN_LIMITS[user.plan]
+
+    if limits["image"] != -1 and user.image_used >= limits["image"]:
+
+        raise HTTPException(403, "Image limit reached")
+
+    img = client.images.generate(
+
+        model="gpt-image-1",
+
+        prompt=prompt,
+
+        size="1024x1024"
+
+    )
+
+    image_bytes = base64.b64decode(
+
+        img.data[0].b64_json
+
+    )
+
+    filename = f"{uuid.uuid4()}.png"
+
+    path = f"outputs/{filename}"
+
+    with open(path, "wb") as f:
+
+        f.write(image_bytes)
+
+    user.image_used += 1
+
+    db.commit()
+
+    return {"image": path}
+
+
 # ================= POSTER =================
 
 @app.post("/ai/poster")
 
-async def poster(title: str = Form(...),
+async def poster(
 
-                 user: User = Depends(get_current_user),
+        title: str = Form(...),
 
-                 db: Session = Depends(get_db)):
+        user: User = Depends(get_current_user),
+
+        db: Session = Depends(get_db)
+
+):
 
     limits = PLAN_LIMITS[user.plan]
 
