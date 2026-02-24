@@ -20,7 +20,6 @@ import os
 import base64
 import uuid
 import logging
-import requests
 
 from openai import OpenAI
 
@@ -56,41 +55,24 @@ JWT_EXPIRE_DAYS = 30
 
 
 if not DATABASE_URL:
-
     raise Exception("DATABASE_URL not set")
 
 
 if DATABASE_URL.startswith("postgres://"):
-
     DATABASE_URL = DATABASE_URL.replace(
-
         "postgres://",
-
         "postgresql://",
-
         1
-
     )
 
-
-# Create OpenAI client safely
 
 client = None
 
 if OPENAI_API_KEY:
-
     client = OpenAI(api_key=OPENAI_API_KEY)
-
-    logger.info("OpenAI client initialized")
-
+    logger.info("OpenAI initialized")
 else:
-
-    logger.warning("OPENAI_API_KEY NOT SET")
-
-
-if not PAYSTACK_SECRET:
-
-    logger.warning("PAYSTACK_SECRET NOT SET")
+    logger.warning("OPENAI_API_KEY missing")
 
 
 # ================= PLAN LIMITS =================
@@ -173,7 +155,7 @@ SessionLocal = sessionmaker(
 Base = declarative_base()
 
 
-# ================= MODELS =================
+# ================= MODEL =================
 
 class User(Base):
 
@@ -205,7 +187,6 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
-
 app.add_middleware(
 
     CORSMiddleware,
@@ -226,12 +207,8 @@ os.makedirs("outputs", exist_ok=True)
 app.mount("/outputs", StaticFiles(directory="outputs"), name="outputs")
 
 
-# ================= ROOT =================
-
 @app.get("/")
-
 def root():
-
     return {"status": "running"}
 
 
@@ -247,39 +224,26 @@ def get_db():
     db = SessionLocal()
 
     try:
-
         yield db
-
     finally:
-
         db.close()
 
 
 def hash_password(password):
-
     return pwd_context.hash(password)
 
 
 def verify_password(password, hashed):
-
     return pwd_context.verify(password, hashed)
 
 
-def create_access_token(data):
+def create_token(data):
 
     expire = datetime.utcnow() + timedelta(days=JWT_EXPIRE_DAYS)
 
     data.update({"exp": expire})
 
-    return jwt.encode(
-
-        data,
-
-        JWT_SECRET,
-
-        algorithm=JWT_ALGORITHM
-
-    )
+    return jwt.encode(data, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
 def get_current_user(
@@ -292,15 +256,7 @@ def get_current_user(
 
     try:
 
-        payload = jwt.decode(
-
-            token,
-
-            JWT_SECRET,
-
-            algorithms=[JWT_ALGORITHM]
-
-        )
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
 
         username = payload.get("sub")
 
@@ -308,14 +264,9 @@ def get_current_user(
 
         raise HTTPException(401, "Invalid token")
 
-    user = db.query(User).filter(
-
-        User.username == username
-
-    ).first()
+    user = db.query(User).filter(User.username == username).first()
 
     if not user:
-
         raise HTTPException(401, "User not found")
 
     return user
@@ -334,53 +285,34 @@ class SignupRequest(BaseModel):
 
 @app.post("/signup")
 
-def signup(
+def signup(data: SignupRequest, db: Session = Depends(get_db)):
 
-        data: SignupRequest,
+    existing = db.query(User).filter(
 
-        db: Session = Depends(get_db)
+        or_(User.username == data.username,
 
-):
+            User.email == data.email)
 
-    try:
+    ).first()
 
-        existing = db.query(User).filter(
+    if existing:
+        raise HTTPException(400, "User exists")
 
-            or_(
+    user = User(
 
-                User.username == data.username,
+        username=data.username,
 
-                User.email == data.email
+        email=data.email,
 
-            )
+        password_hash=hash_password(data.password)
 
-        ).first()
+    )
 
-        if existing:
+    db.add(user)
 
-            raise HTTPException(400, "User already exists")
+    db.commit()
 
-        user = User(
-
-            username=data.username,
-
-            email=data.email,
-
-            password_hash=hash_password(data.password)
-
-        )
-
-        db.add(user)
-
-        db.commit()
-
-        return {"message": "Account created"}
-
-    except Exception as e:
-
-        logger.error(str(e))
-
-        raise HTTPException(500, str(e))
+    return {"message": "Account created"}
 
 
 # ================= LOGIN =================
@@ -395,55 +327,31 @@ def login(
 
 ):
 
-    try:
+    user = db.query(User).filter(
 
-        user = db.query(User).filter(
+        or_(User.username == form.username,
 
-            or_(
+            User.email == form.username)
 
-                User.username == form.username,
+    ).first()
 
-                User.email == form.username
+    if not user:
+        raise HTTPException(401, "Invalid login")
 
-            )
+    if not verify_password(form.password, user.password_hash):
+        raise HTTPException(401, "Invalid login")
 
-        ).first()
+    token = create_token({"sub": user.username})
 
-        if not user:
+    return {
 
-            raise HTTPException(401, "Invalid login")
+        "access_token": token,
 
-        if not verify_password(
+        "token_type": "bearer",
 
-                form.password,
+        "plan": user.plan
 
-                user.password_hash
-
-        ):
-
-            raise HTTPException(401, "Invalid login")
-
-        token = create_access_token(
-
-            {"sub": user.username}
-
-        )
-
-        return {
-
-            "access_token": token,
-
-            "token_type": "bearer",
-
-            "plan": user.plan
-
-        }
-
-    except Exception as e:
-
-        logger.error(str(e))
-
-        raise HTTPException(500, str(e))
+    }
 
 
 # ================= CHAT =================
@@ -460,55 +368,29 @@ async def chat(
 
 ):
 
-    try:
+    if not client:
+        raise HTTPException(500, "OpenAI not configured")
 
-        if not client:
+    limits = PLAN_LIMITS[user.plan]
 
-            raise HTTPException(
+    if limits["chat"] != -1 and user.chat_used >= limits["chat"]:
+        raise HTTPException(403, "Limit reached")
 
-                500,
+    res = client.chat.completions.create(
 
-                "OpenAI not configured"
+        model="gpt-4.1-mini",
 
-            )
+        messages=[{"role": "user", "content": message}]
 
-        limits = PLAN_LIMITS[user.plan]
+    )
 
-        if limits["chat"] != -1 and user.chat_used >= limits["chat"]:
+    reply = res.choices[0].message.content
 
-            raise HTTPException(403, "Chat limit reached")
+    user.chat_used += 1
 
-        res = client.chat.completions.create(
+    db.commit()
 
-            model="gpt-4.1-mini",
-
-            messages=[
-
-                {
-
-                    "role": "user",
-
-                    "content": message
-
-                }
-
-            ]
-
-        )
-
-        reply = res.choices[0].message.content
-
-        user.chat_used += 1
-
-        db.commit()
-
-        return {"reply": reply}
-
-    except Exception as e:
-
-        logger.error(f"CHAT ERROR: {str(e)}")
-
-        raise HTTPException(500, str(e))
+    return {"reply": reply}
 
 
 # ================= IMAGE =================
@@ -525,47 +407,80 @@ async def image(
 
 ):
 
-    try:
+    limits = PLAN_LIMITS[user.plan]
 
-        if not client:
+    if limits["image"] != -1 and user.image_used >= limits["image"]:
+        raise HTTPException(403, "Limit reached")
 
-            raise HTTPException(500, "OpenAI not configured")
+    img = client.images.generate(
 
-        img = client.images.generate(
+        model="gpt-image-1",
 
-            model="gpt-image-1",
+        prompt=prompt,
 
-            prompt=prompt,
+        size="1024x1024"
 
-            size="1024x1024"
+    )
 
-        )
+    image_bytes = base64.b64decode(img.data[0].b64_json)
 
-        image_bytes = base64.b64decode(
+    filename = f"{uuid.uuid4()}.png"
 
-            img.data[0].b64_json
+    path = f"outputs/{filename}"
 
-        )
+    with open(path, "wb") as f:
+        f.write(image_bytes)
 
-        filename = f"{uuid.uuid4()}.png"
+    user.image_used += 1
 
-        path = f"outputs/{filename}"
+    db.commit()
 
-        with open(path, "wb") as f:
+    return {"image": path}
 
-            f.write(image_bytes)
 
-        user.image_used += 1
+# ================= POSTER =================
 
-        db.commit()
+@app.post("/ai/poster")
 
-        return {"image": path}
+async def poster(
 
-    except Exception as e:
+        title: str = Form(...),
 
-        logger.error(str(e))
+        user: User = Depends(get_current_user),
 
-        raise HTTPException(500, str(e))
+        db: Session = Depends(get_db)
+
+):
+
+    limits = PLAN_LIMITS[user.plan]
+
+    if limits["poster"] != -1 and user.poster_used >= limits["poster"]:
+        raise HTTPException(403, "Limit reached")
+
+    img = client.images.generate(
+
+        model="gpt-image-1",
+
+        prompt=title,
+
+        size="1024x1536"
+
+    )
+
+    image_bytes = base64.b64decode(img.data[0].b64_json)
+
+    filename = f"{uuid.uuid4()}.png"
+
+    path = f"outputs/{filename}"
+
+    with open(path, "wb") as f:
+        f.write(image_bytes)
+
+    user.poster_used += 1
+
+    db.commit()
+
+    return {"image": path}
 
 
 # ================= HEALTH =================
@@ -573,7 +488,6 @@ async def image(
 @app.get("/health")
 
 def health():
-
     return {"status": "ok"}
 
 
