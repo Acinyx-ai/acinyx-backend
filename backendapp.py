@@ -1,17 +1,13 @@
 # ================= IMPORTS =================
 
 from fastapi import FastAPI, HTTPException, Depends, Form, UploadFile, File
-
 from fastapi.middleware.cors import CORSMiddleware
-
 from fastapi.staticfiles import StaticFiles
-
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 
 from pydantic import BaseModel, EmailStr
 
 from sqlalchemy import Column, Integer, String, create_engine, or_
-
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 from passlib.context import CryptContext
@@ -21,11 +17,8 @@ from datetime import datetime, timedelta
 from jose import jwt, JWTError
 
 import os
-
 import base64
-
 import uuid
-
 import logging
 
 from openai import OpenAI
@@ -35,14 +28,7 @@ import uvicorn
 
 # ================= LOGGING =================
 
-logging.basicConfig(
-
-    level=logging.INFO,
-
-    format="%(asctime)s [%(levelname)s] %(message)s"
-
-)
-
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("acinyx")
 
 
@@ -52,7 +38,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8000")
+BASE_URL = os.getenv("BASE_URL")
 
 PORT = int(os.getenv("PORT", 8000))
 
@@ -64,22 +50,14 @@ JWT_EXPIRE_DAYS = 30
 
 
 if not DATABASE_URL:
-
     raise Exception("DATABASE_URL not set")
 
 
-# Render fix
-
 if DATABASE_URL.startswith("postgres://"):
-
     DATABASE_URL = DATABASE_URL.replace(
-
         "postgres://",
-
         "postgresql://",
-
         1
-
     )
 
 
@@ -91,7 +69,7 @@ if OPENAI_API_KEY:
 
     client = OpenAI(api_key=OPENAI_API_KEY)
 
-    logger.info("OpenAI initialized")
+    logger.info("OpenAI ready")
 
 else:
 
@@ -102,83 +80,25 @@ else:
 
 PLAN_LIMITS = {
 
-    "free": {
+    "free": {"chat": 20, "image": 3, "poster": 3, "humanize": 20},
 
-        "chat": 20,
+    "basic": {"chat": -1, "image": 50, "poster": 50, "humanize": 100},
 
-        "image": 3,
+    "pro": {"chat": -1, "image": 200, "poster": 200, "humanize": -1},
 
-        "poster": 3,
-
-        "humanize": 20
-
-    },
-
-    "basic": {
-
-        "chat": -1,
-
-        "image": 50,
-
-        "poster": 50,
-
-        "humanize": 100
-
-    },
-
-    "pro": {
-
-        "chat": -1,
-
-        "image": 200,
-
-        "poster": 200,
-
-        "humanize": -1
-
-    },
-
-    "mega": {
-
-        "chat": -1,
-
-        "image": -1,
-
-        "poster": -1,
-
-        "humanize": -1
-
-    }
+    "mega": {"chat": -1, "image": -1, "poster": -1, "humanize": -1}
 
 }
 
 
 # ================= DATABASE =================
 
-engine = create_engine(
+engine = create_engine(DATABASE_URL)
 
-    DATABASE_URL,
-
-    pool_pre_ping=True,
-
-    pool_recycle=300
-
-)
-
-SessionLocal = sessionmaker(
-
-    bind=engine,
-
-    autoflush=False,
-
-    autocommit=False
-
-)
+SessionLocal = sessionmaker(bind=engine)
 
 Base = declarative_base()
 
-
-# ================= USER MODEL =================
 
 class User(Base):
 
@@ -208,17 +128,14 @@ Base.metadata.create_all(bind=engine)
 
 # ================= OUTPUT =================
 
-OUTPUT_DIR = os.path.join(os.getcwd(), "outputs")
+OUTPUT_DIR = "outputs"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-logger.info(f"Output folder: {OUTPUT_DIR}")
 
 
 # ================= APP =================
 
 app = FastAPI()
-
 
 app.add_middleware(
 
@@ -226,37 +143,15 @@ app.add_middleware(
 
     allow_origins=["*"],
 
-    allow_credentials=True,
-
     allow_methods=["*"],
 
-    allow_headers=["*"]
+    allow_headers=["*"],
+
+    allow_credentials=True
 
 )
 
-
-app.mount(
-
-    "/outputs",
-
-    StaticFiles(directory=OUTPUT_DIR),
-
-    name="outputs"
-
-)
-
-
-@app.get("/")
-
-def root():
-
-    return {
-
-        "status": "running",
-
-        "base_url": BASE_URL
-
-    }
+app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
 
 
 # ================= SECURITY =================
@@ -271,11 +166,8 @@ def get_db():
     db = SessionLocal()
 
     try:
-
         yield db
-
     finally:
-
         db.close()
 
 
@@ -295,48 +187,22 @@ def create_token(data):
 
     data.update({"exp": expire})
 
-    return jwt.encode(
-
-        data,
-
-        JWT_SECRET,
-
-        algorithm=JWT_ALGORITHM
-
-    )
+    return jwt.encode(data, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
-def get_current_user(
-
-    token: str = Depends(oauth2_scheme),
-
-    db: Session = Depends(get_db)
-
-):
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
 
     try:
 
-        payload = jwt.decode(
-
-            token,
-
-            JWT_SECRET,
-
-            algorithms=[JWT_ALGORITHM]
-
-        )
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
 
         username = payload.get("sub")
 
-    except JWTError:
+    except:
 
         raise HTTPException(401, "Invalid token")
 
-    user = db.query(User).filter(
-
-        User.username == username
-
-    ).first()
+    user = db.query(User).filter(User.username == username).first()
 
     if not user:
 
@@ -358,27 +224,11 @@ class SignupRequest(BaseModel):
 
 @app.post("/signup")
 
-def signup(
+def signup(data: SignupRequest, db: Session = Depends(get_db)):
 
-    data: SignupRequest,
+    exists = db.query(User).filter(or_(User.username == data.username, User.email == data.email)).first()
 
-    db: Session = Depends(get_db)
-
-):
-
-    existing = db.query(User).filter(
-
-        or_(
-
-            User.username == data.username,
-
-            User.email == data.email
-
-        )
-
-    ).first()
-
-    if existing:
+    if exists:
 
         raise HTTPException(400, "User exists")
 
@@ -388,15 +238,13 @@ def signup(
 
         email=data.email,
 
-        password_hash=hash_password(data.password)
+        password_hash=hash_password(data.password),
 
     )
 
     db.add(user)
 
     db.commit()
-
-    db.refresh(user)
 
     return {"message": "Account created"}
 
@@ -405,228 +253,100 @@ def signup(
 
 @app.post("/token")
 
-def login(
+def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
 
-    form: OAuth2PasswordRequestForm = Depends(),
-
-    db: Session = Depends(get_db)
-
-):
-
-    user = db.query(User).filter(
-
-        or_(
-
-            User.username == form.username,
-
-            User.email == form.username
-
-        )
-
-    ).first()
+    user = db.query(User).filter(or_(User.username == form.username, User.email == form.username)).first()
 
     if not user:
 
         raise HTTPException(401, "Invalid login")
 
-    if not verify_password(
-
-        form.password,
-
-        user.password_hash
-
-    ):
+    if not verify_password(form.password, user.password_hash):
 
         raise HTTPException(401, "Invalid login")
 
-    token = create_token(
+    token = create_token({"sub": user.username})
 
-        {"sub": user.username}
-
-    )
-
-    return {
-
-        "access_token": token,
-
-        "token_type": "bearer",
-
-        "plan": user.plan
-
-    }
+    return {"access_token": token, "token_type": "bearer", "plan": user.plan}
 
 
 # ================= CHAT =================
 
 @app.post("/ai/chat")
 
-async def chat(
+async def chat(message: str = Form(...), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
 
-    message: str = Form(...),
+    if not client:
+        raise HTTPException(500, "OpenAI not configured")
 
-    user: User = Depends(get_current_user),
+    res = client.chat.completions.create(
 
-    db: Session = Depends(get_db)
+        model="gpt-4.1-mini",
 
-):
+        messages=[{"role": "user", "content": message}]
 
-    limits = PLAN_LIMITS[user.plan]
-
-    if limits["chat"] != -1 and user.chat_used >= limits["chat"]:
-
-        raise HTTPException(403, "Limit reached")
-
-    try:
-
-        res = client.chat.completions.create(
-
-            model="gpt-4.1-mini",
-
-            messages=[
-
-                {"role": "user", "content": message}
-
-            ]
-
-        )
-
-        reply = res.choices[0].message.content
-
-    except Exception as e:
-
-        logger.error(e)
-
-        raise HTTPException(500, "Chat failed")
+    )
 
     user.chat_used += 1
 
     db.commit()
 
-    return {"reply": reply}
+    return {"reply": res.choices[0].message.content}
 
 
-# ================= HUMANIZER =================
+# ================= HUMANIZE =================
 
 @app.post("/ai/humanize")
 
-async def humanize(
+async def humanize(message: str = Form(...), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
 
-    text: str = Form(...),
+    if not client:
+        raise HTTPException(500, "OpenAI not configured")
 
-    user: User = Depends(get_current_user),
+    res = client.chat.completions.create(
 
-    db: Session = Depends(get_db)
+        model="gpt-4.1-mini",
 
-):
+        messages=[{"role": "user", "content": f"Rewrite naturally:\n{message}"}]
 
-    limits = PLAN_LIMITS[user.plan]
-
-    if limits["humanize"] != -1 and user.humanize_used >= limits["humanize"]:
-
-        raise HTTPException(403, "Limit reached")
-
-    try:
-
-        res = client.chat.completions.create(
-
-            model="gpt-4.1-mini",
-
-            messages=[
-
-                {
-
-                    "role": "user",
-
-                    "content": f"Rewrite this naturally:\n{text}"
-
-                }
-
-            ]
-
-        )
-
-        reply = res.choices[0].message.content
-
-    except Exception as e:
-
-        logger.error(e)
-
-        raise HTTPException(500, "Humanizer failed")
+    )
 
     user.humanize_used += 1
 
     db.commit()
 
-    return {"reply": reply}
+    return {"reply": res.choices[0].message.content}
 
 
 # ================= IMAGE =================
 
 @app.post("/ai/image")
 
-async def image(
+async def image(prompt: str = Form(...), user: User = Depends(get_current_user), db: Session = Depends(get_db)):
 
-    prompt: str = Form(...),
+    result = client.images.generate(
 
-    user: User = Depends(get_current_user),
+        model="gpt-image-1",
 
-    db: Session = Depends(get_db)
+        prompt=prompt,
 
-):
-
-    limits = PLAN_LIMITS[user.plan]
-
-    if limits["image"] != -1 and user.image_used >= limits["image"]:
-
-        raise HTTPException(403, "Limit reached")
-
-    try:
-
-        result = client.images.generate(
-
-            model="gpt-image-1",
-
-            prompt=prompt,
-
-            size="1024x1024"
-
-        )
-
-        image_bytes = base64.b64decode(
-
-            result.data[0].b64_json
-
-        )
-
-    except Exception as e:
-
-        logger.error(e)
-
-        raise HTTPException(500, "Image failed")
-
-    filename = f"{uuid.uuid4()}.png"
-
-    path = os.path.join(
-
-        OUTPUT_DIR,
-
-        filename
+        size="1024x1024"
 
     )
 
+    filename = f"{uuid.uuid4()}.png"
+
+    path = f"{OUTPUT_DIR}/{filename}"
+
     with open(path, "wb") as f:
 
-        f.write(image_bytes)
+        f.write(base64.b64decode(result.data[0].b64_json))
 
     user.image_used += 1
 
     db.commit()
 
-    return {
-
-        "image": f"{BASE_URL}/outputs/{filename}"
-
-    }
+    return {"image": f"{BASE_URL}/outputs/{filename}"}
 
 
 # ================= POSTER =================
@@ -637,77 +357,47 @@ async def poster(
 
     title: str = Form(...),
 
+    description: str = Form(""),
+
+    microscopic_details: str = Form(""),
+
+    style: str = Form("cinematic"),
+
     user: User = Depends(get_current_user),
 
     db: Session = Depends(get_db)
 
 ):
 
-    limits = PLAN_LIMITS[user.plan]
+    prompt = f"{title}\n{description}\n{microscopic_details}\n{style}"
 
-    if limits["poster"] != -1 and user.poster_used >= limits["poster"]:
+    result = client.images.generate(
 
-        raise HTTPException(403, "Limit reached")
+        model="gpt-image-1",
 
-    try:
+        prompt=prompt,
 
-        result = client.images.generate(
-
-            model="gpt-image-1",
-
-            prompt=title,
-
-            size="1024x1536"
-
-        )
-
-        image_bytes = base64.b64decode(
-
-            result.data[0].b64_json
-
-        )
-
-    except Exception as e:
-
-        logger.error(e)
-
-        raise HTTPException(500, "Poster failed")
-
-    filename = f"{uuid.uuid4()}.png"
-
-    path = os.path.join(
-
-        OUTPUT_DIR,
-
-        filename
+        size="1024x1536"
 
     )
 
+    filename = f"{uuid.uuid4()}.png"
+
+    path = f"{OUTPUT_DIR}/{filename}"
+
     with open(path, "wb") as f:
 
-        f.write(image_bytes)
+        f.write(base64.b64decode(result.data[0].b64_json))
 
     user.poster_used += 1
 
     db.commit()
 
-    return {
-
-        "image": f"{BASE_URL}/outputs/{filename}"
-
-    }
+    return {"image": f"{BASE_URL}/outputs/{filename}"}
 
 
 # ================= RUN =================
 
 if __name__ == "__main__":
 
-    uvicorn.run(
-
-        "backendapp:app",
-
-        host="0.0.0.0",
-
-        port=PORT
-
-    )
+    uvicorn.run("backendapp:app", host="0.0.0.0", port=PORT)
