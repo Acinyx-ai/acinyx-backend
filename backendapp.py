@@ -86,13 +86,13 @@ else:
 
 PLAN_LIMITS = {
 
-    "free": {"chat": 20, "poster": 3, "image": 3},
+    "free": {"chat": 20, "poster": 3, "image": 3, "humanize": 20},
 
-    "basic": {"chat": -1, "poster": 50, "image": 50},
+    "basic": {"chat": -1, "poster": 50, "image": 50, "humanize": 100},
 
-    "pro": {"chat": -1, "poster": 200, "image": 200},
+    "pro": {"chat": -1, "poster": 200, "image": 200, "humanize": -1},
 
-    "mega": {"chat": -1, "poster": -1, "image": -1}
+    "mega": {"chat": -1, "poster": -1, "image": -1, "humanize": -1}
 
 }
 
@@ -114,6 +114,8 @@ SessionLocal = sessionmaker(
 Base = declarative_base()
 
 
+# ================= USER MODEL =================
+
 class User(Base):
 
     __tablename__ = "users"
@@ -134,6 +136,8 @@ class User(Base):
 
     image_used = Column(Integer, default=0)
 
+    humanize_used = Column(Integer, default=0)
+
 
 Base.metadata.create_all(bind=engine)
 
@@ -144,11 +148,15 @@ OUTPUT_DIR = os.path.join(os.getcwd(), "outputs")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+logger.info(f"Outputs folder: {OUTPUT_DIR}")
+
 
 # ================= APP =================
 
 app = FastAPI()
 
+
+# ================= CORS =================
 
 app.add_middleware(
 
@@ -165,12 +173,20 @@ app.add_middleware(
 )
 
 
+# ================= STATIC =================
+
 app.mount(
+
     "/outputs",
+
     StaticFiles(directory=OUTPUT_DIR),
+
     name="outputs"
+
 )
 
+
+# ================= ROOT =================
 
 @app.get("/")
 def root():
@@ -194,6 +210,7 @@ def get_db():
 
     try:
         yield db
+
     finally:
         db.close()
 
@@ -359,12 +376,10 @@ async def chat(
 
 ):
 
-    if not client:
-        raise HTTPException(500, "OpenAI not configured")
-
     limits = PLAN_LIMITS[user.plan]
 
     if limits["chat"] != -1 and user.chat_used >= limits["chat"]:
+
         raise HTTPException(403, "Limit reached")
 
     try:
@@ -396,6 +411,61 @@ async def chat(
     return {"reply": reply}
 
 
+# ================= HUMANIZER =================
+
+@app.post("/ai/humanize")
+
+async def humanize(
+
+    text: str = Form(...),
+
+    user: User = Depends(get_current_user),
+
+    db: Session = Depends(get_db)
+
+):
+
+    limits = PLAN_LIMITS[user.plan]
+
+    if limits["humanize"] != -1 and user.humanize_used >= limits["humanize"]:
+
+        raise HTTPException(403, "Limit reached")
+
+    try:
+
+        res = client.chat.completions.create(
+
+            model="gpt-4.1-mini",
+
+            messages=[
+
+                {
+
+                    "role": "user",
+
+                    "content": f"Rewrite this in natural human tone:\n\n{text}"
+
+                }
+
+            ]
+
+        )
+
+        reply = res.choices[0].message.content
+
+    except Exception as e:
+
+        logger.error(e)
+
+        raise HTTPException(500, "Humanize failed")
+
+    user.humanize_used += 1
+
+    db.commit()
+
+    return {"reply": reply}
+
+
 # ================= IMAGE =================
 
 @app.post("/ai/image")
@@ -410,44 +480,30 @@ async def image(
 
 ):
 
-    if not client:
-        raise HTTPException(500, "OpenAI not configured")
-
     limits = PLAN_LIMITS[user.plan]
 
     if limits["image"] != -1 and user.image_used >= limits["image"]:
+
         raise HTTPException(403, "Limit reached")
 
-    try:
+    result = client.images.generate(
 
-        img = client.images.generate(
+        model="gpt-image-1",
 
-            model="gpt-image-1",
+        prompt=prompt,
 
-            prompt=prompt,
+        size="1024x1024"
 
-            size="1024x1024"
+    )
 
-        )
-
-        image_bytes = base64.b64decode(
-            img.data[0].b64_json
-        )
-
-    except Exception as e:
-
-        logger.error(e)
-
-        raise HTTPException(500, "Image failed")
+    image_bytes = base64.b64decode(result.data[0].b64_json)
 
     filename = f"{uuid.uuid4()}.png"
 
-    full_path = os.path.join(
-        OUTPUT_DIR,
-        filename
-    )
+    path = os.path.join(OUTPUT_DIR, filename)
 
-    with open(full_path, "wb") as f:
+    with open(path, "wb") as f:
+
         f.write(image_bytes)
 
     user.image_used += 1
@@ -455,11 +511,13 @@ async def image(
     db.commit()
 
     return {
-        "image": f"{BASE_URL}/outputs/{filename}"
+
+        "image": f"outputs/{filename}"
+
     }
 
 
-# ================= ULTRA POSTER =================
+# ================= POSTER =================
 
 @app.post("/ai/poster")
 
@@ -473,26 +531,16 @@ async def poster(
 
     style: str = Form("cinematic"),
 
-    lighting: str = Form("cinematic"),
-
-    quality: str = Form("ultra"),
-
-    creativity: str = Form("balanced"),
-
-    image: UploadFile = File(None),
-
     user: User = Depends(get_current_user),
 
     db: Session = Depends(get_db)
 
 ):
 
-    if not client:
-        raise HTTPException(500, "OpenAI not configured")
-
     limits = PLAN_LIMITS[user.plan]
 
     if limits["poster"] != -1 and user.poster_used >= limits["poster"]:
+
         raise HTTPException(403, "Limit reached")
 
     prompt = f"""
@@ -501,49 +549,32 @@ TITLE: {title}
 
 DESCRIPTION: {description}
 
-MICROSCOPIC DETAILS: {microscopic_details}
+DETAILS: {microscopic_details}
 
 STYLE: {style}
 
-LIGHTING: {lighting}
-
-QUALITY: {quality}
-
-CREATIVITY: {creativity}
-
 Ultra detailed molecular realism
+
 """
 
-    try:
+    result = client.images.generate(
 
-        result = client.images.generate(
+        model="gpt-image-1",
 
-            model="gpt-image-1",
+        prompt=prompt,
 
-            prompt=prompt,
+        size="1024x1536"
 
-            size="1024x1536"
+    )
 
-        )
-
-        image_bytes = base64.b64decode(
-            result.data[0].b64_json
-        )
-
-    except Exception as e:
-
-        logger.error(e)
-
-        raise HTTPException(500, "Poster failed")
+    image_bytes = base64.b64decode(result.data[0].b64_json)
 
     filename = f"{uuid.uuid4()}.png"
 
-    full_path = os.path.join(
-        OUTPUT_DIR,
-        filename
-    )
+    path = os.path.join(OUTPUT_DIR, filename)
 
-    with open(full_path, "wb") as f:
+    with open(path, "wb") as f:
+
         f.write(image_bytes)
 
     user.poster_used += 1
@@ -551,7 +582,9 @@ Ultra detailed molecular realism
     db.commit()
 
     return {
-        "image": f"{BASE_URL}/outputs/{filename}"
+
+        "image": f"outputs/{filename}"
+
     }
 
 
