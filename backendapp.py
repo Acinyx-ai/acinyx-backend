@@ -1,13 +1,17 @@
 # ================= IMPORTS =================
 
 from fastapi import FastAPI, HTTPException, Depends, Form, UploadFile, File
+
 from fastapi.middleware.cors import CORSMiddleware
+
 from fastapi.staticfiles import StaticFiles
+
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 
 from pydantic import BaseModel, EmailStr
 
 from sqlalchemy import Column, Integer, String, create_engine, or_
+
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 from passlib.context import CryptContext
@@ -17,8 +21,11 @@ from datetime import datetime, timedelta
 from jose import jwt, JWTError
 
 import os
+
 import base64
+
 import uuid
+
 import logging
 
 from openai import OpenAI
@@ -29,8 +36,11 @@ import uvicorn
 # ================= LOGGING =================
 
 logging.basicConfig(
+
     level=logging.INFO,
+
     format="%(asctime)s [%(levelname)s] %(message)s"
+
 )
 
 logger = logging.getLogger("acinyx")
@@ -42,17 +52,11 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-BASE_URL = os.getenv(
-    "BASE_URL",
-    "http://127.0.0.1:8000"
-)
+BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:8000")
 
 PORT = int(os.getenv("PORT", 8000))
 
-JWT_SECRET = os.getenv(
-    "JWT_SECRET",
-    "CHANGE_THIS_SECRET"
-)
+JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_SECRET")
 
 JWT_ALGORITHM = "HS256"
 
@@ -60,14 +64,22 @@ JWT_EXPIRE_DAYS = 30
 
 
 if not DATABASE_URL:
+
     raise Exception("DATABASE_URL not set")
 
 
+# Render fix
+
 if DATABASE_URL.startswith("postgres://"):
+
     DATABASE_URL = DATABASE_URL.replace(
+
         "postgres://",
+
         "postgresql://",
+
         1
+
     )
 
 
@@ -76,23 +88,67 @@ if DATABASE_URL.startswith("postgres://"):
 client = None
 
 if OPENAI_API_KEY:
+
     client = OpenAI(api_key=OPENAI_API_KEY)
+
     logger.info("OpenAI initialized")
+
 else:
-    logger.warning("OPENAI_API_KEY missing")
+
+    logger.error("OPENAI_API_KEY missing")
 
 
 # ================= PLAN LIMITS =================
 
 PLAN_LIMITS = {
 
-    "free": {"chat": 20, "poster": 3, "image": 3, "humanize": 20},
+    "free": {
 
-    "basic": {"chat": -1, "poster": 50, "image": 50, "humanize": 100},
+        "chat": 20,
 
-    "pro": {"chat": -1, "poster": 200, "image": 200, "humanize": -1},
+        "image": 3,
 
-    "mega": {"chat": -1, "poster": -1, "image": -1, "humanize": -1}
+        "poster": 3,
+
+        "humanize": 20
+
+    },
+
+    "basic": {
+
+        "chat": -1,
+
+        "image": 50,
+
+        "poster": 50,
+
+        "humanize": 100
+
+    },
+
+    "pro": {
+
+        "chat": -1,
+
+        "image": 200,
+
+        "poster": 200,
+
+        "humanize": -1
+
+    },
+
+    "mega": {
+
+        "chat": -1,
+
+        "image": -1,
+
+        "poster": -1,
+
+        "humanize": -1
+
+    }
 
 }
 
@@ -100,15 +156,23 @@ PLAN_LIMITS = {
 # ================= DATABASE =================
 
 engine = create_engine(
+
     DATABASE_URL,
+
     pool_pre_ping=True,
+
     pool_recycle=300
+
 )
 
 SessionLocal = sessionmaker(
+
     bind=engine,
+
     autoflush=False,
+
     autocommit=False
+
 )
 
 Base = declarative_base()
@@ -132,9 +196,9 @@ class User(Base):
 
     chat_used = Column(Integer, default=0)
 
-    poster_used = Column(Integer, default=0)
-
     image_used = Column(Integer, default=0)
+
+    poster_used = Column(Integer, default=0)
 
     humanize_used = Column(Integer, default=0)
 
@@ -148,15 +212,13 @@ OUTPUT_DIR = os.path.join(os.getcwd(), "outputs")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-logger.info(f"Outputs folder: {OUTPUT_DIR}")
+logger.info(f"Output folder: {OUTPUT_DIR}")
 
 
 # ================= APP =================
 
 app = FastAPI()
 
-
-# ================= CORS =================
 
 app.add_middleware(
 
@@ -173,8 +235,6 @@ app.add_middleware(
 )
 
 
-# ================= STATIC =================
-
 app.mount(
 
     "/outputs",
@@ -186,14 +246,16 @@ app.mount(
 )
 
 
-# ================= ROOT =================
-
 @app.get("/")
+
 def root():
 
     return {
+
         "status": "running",
+
         "base_url": BASE_URL
+
     }
 
 
@@ -209,9 +271,11 @@ def get_db():
     db = SessionLocal()
 
     try:
+
         yield db
 
     finally:
+
         db.close()
 
 
@@ -232,23 +296,34 @@ def create_token(data):
     data.update({"exp": expire})
 
     return jwt.encode(
+
         data,
+
         JWT_SECRET,
+
         algorithm=JWT_ALGORITHM
+
     )
 
 
 def get_current_user(
+
     token: str = Depends(oauth2_scheme),
+
     db: Session = Depends(get_db)
+
 ):
 
     try:
 
         payload = jwt.decode(
+
             token,
+
             JWT_SECRET,
+
             algorithms=[JWT_ALGORITHM]
+
         )
 
         username = payload.get("sub")
@@ -258,10 +333,13 @@ def get_current_user(
         raise HTTPException(401, "Invalid token")
 
     user = db.query(User).filter(
+
         User.username == username
+
     ).first()
 
     if not user:
+
         raise HTTPException(401, "User not found")
 
     return user
@@ -281,8 +359,11 @@ class SignupRequest(BaseModel):
 @app.post("/signup")
 
 def signup(
+
     data: SignupRequest,
+
     db: Session = Depends(get_db)
+
 ):
 
     existing = db.query(User).filter(
@@ -298,6 +379,7 @@ def signup(
     ).first()
 
     if existing:
+
         raise HTTPException(400, "User exists")
 
     user = User(
@@ -314,6 +396,8 @@ def signup(
 
     db.commit()
 
+    db.refresh(user)
+
     return {"message": "Account created"}
 
 
@@ -322,8 +406,11 @@ def signup(
 @app.post("/token")
 
 def login(
+
     form: OAuth2PasswordRequestForm = Depends(),
+
     db: Session = Depends(get_db)
+
 ):
 
     user = db.query(User).filter(
@@ -339,16 +426,23 @@ def login(
     ).first()
 
     if not user:
+
         raise HTTPException(401, "Invalid login")
 
     if not verify_password(
+
         form.password,
+
         user.password_hash
+
     ):
+
         raise HTTPException(401, "Invalid login")
 
     token = create_token(
+
         {"sub": user.username}
+
     )
 
     return {
@@ -443,7 +537,7 @@ async def humanize(
 
                     "role": "user",
 
-                    "content": f"Rewrite this in natural human tone:\n\n{text}"
+                    "content": f"Rewrite this naturally:\n{text}"
 
                 }
 
@@ -457,7 +551,7 @@ async def humanize(
 
         logger.error(e)
 
-        raise HTTPException(500, "Humanize failed")
+        raise HTTPException(500, "Humanizer failed")
 
     user.humanize_used += 1
 
@@ -486,21 +580,39 @@ async def image(
 
         raise HTTPException(403, "Limit reached")
 
-    result = client.images.generate(
+    try:
 
-        model="gpt-image-1",
+        result = client.images.generate(
 
-        prompt=prompt,
+            model="gpt-image-1",
 
-        size="1024x1024"
+            prompt=prompt,
 
-    )
+            size="1024x1024"
 
-    image_bytes = base64.b64decode(result.data[0].b64_json)
+        )
+
+        image_bytes = base64.b64decode(
+
+            result.data[0].b64_json
+
+        )
+
+    except Exception as e:
+
+        logger.error(e)
+
+        raise HTTPException(500, "Image failed")
 
     filename = f"{uuid.uuid4()}.png"
 
-    path = os.path.join(OUTPUT_DIR, filename)
+    path = os.path.join(
+
+        OUTPUT_DIR,
+
+        filename
+
+    )
 
     with open(path, "wb") as f:
 
@@ -512,7 +624,7 @@ async def image(
 
     return {
 
-        "image": f"outputs/{filename}"
+        "image": f"{BASE_URL}/outputs/{filename}"
 
     }
 
@@ -524,12 +636,6 @@ async def image(
 async def poster(
 
     title: str = Form(...),
-
-    description: str = Form(""),
-
-    microscopic_details: str = Form(""),
-
-    style: str = Form("cinematic"),
 
     user: User = Depends(get_current_user),
 
@@ -543,35 +649,39 @@ async def poster(
 
         raise HTTPException(403, "Limit reached")
 
-    prompt = f"""
+    try:
 
-TITLE: {title}
+        result = client.images.generate(
 
-DESCRIPTION: {description}
+            model="gpt-image-1",
 
-DETAILS: {microscopic_details}
+            prompt=title,
 
-STYLE: {style}
+            size="1024x1536"
 
-Ultra detailed molecular realism
+        )
 
-"""
+        image_bytes = base64.b64decode(
 
-    result = client.images.generate(
+            result.data[0].b64_json
 
-        model="gpt-image-1",
+        )
 
-        prompt=prompt,
+    except Exception as e:
 
-        size="1024x1536"
+        logger.error(e)
 
-    )
-
-    image_bytes = base64.b64decode(result.data[0].b64_json)
+        raise HTTPException(500, "Poster failed")
 
     filename = f"{uuid.uuid4()}.png"
 
-    path = os.path.join(OUTPUT_DIR, filename)
+    path = os.path.join(
+
+        OUTPUT_DIR,
+
+        filename
+
+    )
 
     with open(path, "wb") as f:
 
@@ -583,18 +693,9 @@ Ultra detailed molecular realism
 
     return {
 
-        "image": f"outputs/{filename}"
+        "image": f"{BASE_URL}/outputs/{filename}"
 
     }
-
-
-# ================= HEALTH =================
-
-@app.get("/health")
-
-def health():
-
-    return {"status": "ok"}
 
 
 # ================= RUN =================
