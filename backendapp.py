@@ -42,7 +42,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-BASE_URL = os.getenv("BASE_URL")
+BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
 
 PORT = int(os.getenv("PORT", 8000))
 
@@ -56,8 +56,15 @@ JWT_EXPIRE_DAYS = 30
 if not DATABASE_URL:
     raise Exception("DATABASE_URL not set")
 
+if not OPENAI_API_KEY:
+    raise Exception("OPENAI_API_KEY missing")
 
-# Render PostgreSQL fix
+if not BASE_URL:
+    raise Exception("BASE_URL not set")
+
+
+# Fix Render postgres
+
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace(
         "postgres://",
@@ -66,14 +73,7 @@ if DATABASE_URL.startswith("postgres://"):
     )
 
 
-if not BASE_URL:
-    raise Exception("BASE_URL not set")
-
-
 # ================= OPENAI =================
-
-if not OPENAI_API_KEY:
-    raise Exception("OPENAI_API_KEY missing")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -248,7 +248,15 @@ def create_token(data):
 
     data.update({"exp": expire})
 
-    return jwt.encode(data, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return jwt.encode(
+
+        data,
+
+        JWT_SECRET,
+
+        algorithm=JWT_ALGORITHM
+
+    )
 
 
 def get_current_user(
@@ -339,6 +347,8 @@ def signup(
     db.add(user)
 
     db.commit()
+
+    db.refresh(user)
 
     return {"message": "Account created"}
 
@@ -456,25 +466,35 @@ async def humanize(
 
         raise HTTPException(403, "Limit reached")
 
-    res = client.chat.completions.create(
+    try:
 
-        model="gpt-4.1-mini",
+        res = client.chat.completions.create(
 
-        messages=[{
+            model="gpt-4.1-mini",
 
-            "role": "user",
+            messages=[{
 
-            "content": f"Rewrite naturally:\n{message}"
+                "role": "user",
 
-        }]
+                "content": f"Rewrite naturally:\n{message}"
 
-    )
+            }]
+
+        )
+
+        reply = res.choices[0].message.content
+
+    except Exception as e:
+
+        logger.error(e)
+
+        raise HTTPException(500, "Humanizer failed")
 
     user.humanize_used += 1
 
     db.commit()
 
-    return {"reply": res.choices[0].message.content}
+    return {"reply": reply}
 
 
 # ================= IMAGE =================
@@ -496,15 +516,25 @@ async def image(
 
         raise HTTPException(403, "Limit reached")
 
-    result = client.images.generate(
+    try:
 
-        model="gpt-image-1",
+        result = client.images.generate(
 
-        prompt=prompt,
+            model="gpt-image-1",
 
-        size="1024x1024"
+            prompt=prompt,
 
-    )
+            size="1024x1024"
+
+        )
+
+        image_bytes = base64.b64decode(result.data[0].b64_json)
+
+    except Exception as e:
+
+        logger.error(e)
+
+        raise HTTPException(500, "Image failed")
 
     filename = f"{uuid.uuid4()}.png"
 
@@ -512,13 +542,17 @@ async def image(
 
     with open(path, "wb") as f:
 
-        f.write(base64.b64decode(result.data[0].b64_json))
+        f.write(image_bytes)
 
     user.image_used += 1
 
     db.commit()
 
-    return {"image": f"{BASE_URL}/outputs/{filename}"}
+    return {
+
+        "image": f"{BASE_URL}/outputs/{filename}"
+
+    }
 
 
 # ================= POSTER =================
@@ -548,15 +582,25 @@ async def poster(
 
     prompt = f"{title}\n{description}\n{microscopic_details}\n{style}"
 
-    result = client.images.generate(
+    try:
 
-        model="gpt-image-1",
+        result = client.images.generate(
 
-        prompt=prompt,
+            model="gpt-image-1",
 
-        size="1024x1536"
+            prompt=prompt,
 
-    )
+            size="1024x1536"
+
+        )
+
+        image_bytes = base64.b64decode(result.data[0].b64_json)
+
+    except Exception as e:
+
+        logger.error(e)
+
+        raise HTTPException(500, "Poster failed")
 
     filename = f"{uuid.uuid4()}.png"
 
@@ -564,13 +608,17 @@ async def poster(
 
     with open(path, "wb") as f:
 
-        f.write(base64.b64decode(result.data[0].b64_json))
+        f.write(image_bytes)
 
     user.poster_used += 1
 
     db.commit()
 
-    return {"image": f"{BASE_URL}/outputs/{filename}"}
+    return {
+
+        "image": f"{BASE_URL}/outputs/{filename}"
+
+    }
 
 
 # ================= RUN =================
