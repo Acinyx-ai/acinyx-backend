@@ -4,7 +4,8 @@ from fastapi import FastAPI, HTTPException, Depends, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi import Request
 
 from pydantic import BaseModel, EmailStr
 
@@ -22,6 +23,7 @@ import os
 import base64
 import uuid
 import logging
+import requests  # MOVED TO TOP (FIXED)
 
 from openai import OpenAI
 
@@ -80,8 +82,14 @@ PLAN_LIMITS = {
 
 # ================= DATABASE =================
 
+# Handle SQLite vs PostgreSQL
+connect_args = {}
+if DATABASE_URL.startswith("sqlite"):
+    connect_args = {"check_same_thread": False}
+
 engine = create_engine(
     DATABASE_URL,
+    connect_args=connect_args,
     pool_pre_ping=True,
     pool_recycle=300
 )
@@ -151,6 +159,7 @@ app.mount(
 # ================= HEALTH =================
 
 @app.get("/health")
+@app.head("/health")  # ADDED HEAD support
 def health():
     return {"status": "ok"}
 
@@ -158,6 +167,7 @@ def health():
 # ================= ROOT =================
 
 @app.get("/")
+@app.head("/")  # ADDED HEAD support (FIXES 405 ERROR)
 def root():
     return {"status": "running"}
 
@@ -261,6 +271,8 @@ def signup(data: Signup, db: Session = Depends(get_db)):
         db.refresh(user)
 
         return {"ok": True, "message": "User created successfully"}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Signup error: {str(e)}")
         raise HTTPException(500, "Internal server error")
@@ -365,7 +377,6 @@ async def image(prompt: str = Form(...),
         )
         
         # Download image from URL
-        import requests
         img_url = response.data[0].url
         img_response = requests.get(img_url)
         
@@ -382,7 +393,12 @@ async def image(prompt: str = Form(...),
         # Increment usage
         increment_usage(user, "image", db)
         
-        return {"image": f"/outputs/{filename}", "success": True}
+        # Return full URL or path
+        image_url = f"/outputs/{filename}"
+        if BASE_URL:
+            image_url = f"{BASE_URL}{image_url}"
+            
+        return {"image": image_url, "success": True}
     except HTTPException:
         raise
     except Exception as e:
@@ -415,7 +431,6 @@ async def poster(prompt: str = Form(...),
         )
         
         # Download image
-        import requests
         img_url = response.data[0].url
         img_response = requests.get(img_url)
         
@@ -432,7 +447,12 @@ async def poster(prompt: str = Form(...),
         # Increment usage
         increment_usage(user, "poster", db)
         
-        return {"poster": f"/posters/{filename}", "success": True}
+        # Return full URL or path
+        poster_url = f"/posters/{filename}"
+        if BASE_URL:
+            poster_url = f"{BASE_URL}{poster_url}"
+            
+        return {"poster": poster_url, "success": True}
     except HTTPException:
         raise
     except Exception as e:
@@ -474,10 +494,25 @@ async def humanize(text: str = Form(...),
         raise HTTPException(500, f"Server error: {str(e)}")
 
 
+# ================= FILE SERVER =================
+
+@app.get("/files/{file_type}/{filename}")
+async def get_file(file_type: str, filename: str):
+    """Serve generated files"""
+    if file_type not in ["outputs", "posters"]:
+        raise HTTPException(404, "File type not found")
+    
+    file_path = os.path.join(file_type, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(404, "File not found")
+    
+    return FileResponse(file_path)
+
+
 # ================= ERROR HANDLERS =================
 
 @app.exception_handler(HTTPException)
-async def http_exception_handler(request, exc):
+async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(
         status_code=exc.status_code,
         content={"detail": exc.detail, "success": False}
@@ -485,7 +520,7 @@ async def http_exception_handler(request, exc):
 
 
 @app.exception_handler(Exception)
-async def general_exception_handler(request, exc):
+async def general_exception_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled exception: {str(exc)}")
     return JSONResponse(
         status_code=500,
