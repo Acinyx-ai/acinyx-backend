@@ -23,7 +23,7 @@ import os
 import base64
 import uuid
 import logging
-import requests  # MOVED TO TOP (FIXED)
+import requests
 
 from openai import OpenAI
 
@@ -39,33 +39,20 @@ logger = logging.getLogger("acinyx")
 # ================= CONFIG =================
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
 DATABASE_URL = os.getenv("DATABASE_URL")
-
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
-
 PORT = int(os.getenv("PORT", 8000))
-
 JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_SECRET")
-
 JWT_ALGORITHM = "HS256"
-
 JWT_EXPIRE_DAYS = 30
-
 
 if not DATABASE_URL:
     raise Exception("DATABASE_URL missing")
-
 if not OPENAI_API_KEY:
     raise Exception("OPENAI_API_KEY missing")
 
 if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace(
-        "postgres://",
-        "postgresql://",
-        1
-    )
-
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -82,7 +69,6 @@ PLAN_LIMITS = {
 
 # ================= DATABASE =================
 
-# Handle SQLite vs PostgreSQL
 connect_args = {}
 if DATABASE_URL.startswith("sqlite"):
     connect_args = {"check_same_thread": False}
@@ -93,6 +79,14 @@ engine = create_engine(
     pool_pre_ping=True,
     pool_recycle=300
 )
+
+# Test database connection
+try:
+    with engine.connect() as conn:
+        logger.info("✅ Database connection successful")
+except Exception as e:
+    logger.error(f"❌ Database connection failed: {e}")
+    raise
 
 SessionLocal = sessionmaker(
     bind=engine,
@@ -131,7 +125,28 @@ os.makedirs(POSTER_DIR, exist_ok=True)
 
 # ================= APP =================
 
-app = FastAPI()
+app = FastAPI(title="Acinyx.AI API", version="1.0.0")
+
+
+# ================= MIDDLEWARE =================
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log all requests for debugging"""
+    logger.info(f"📥 {request.method} {request.url.path}")
+    start_time = datetime.utcnow()
+    
+    try:
+        response = await call_next(request)
+        process_time = (datetime.utcnow() - start_time).total_seconds() * 1000
+        logger.info(f"📤 {request.method} {request.url.path} - {response.status_code} - {process_time:.0f}ms")
+        return response
+    except Exception as e:
+        logger.error(f"❌ Request failed: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error", "success": False}
+        )
 
 
 app.add_middleware(
@@ -143,39 +158,65 @@ app.add_middleware(
 )
 
 
-app.mount(
-    "/outputs",
-    StaticFiles(directory=OUTPUT_DIR),
-    name="outputs"
-)
+# ================= STATIC FILES =================
 
-app.mount(
-    "/posters",
-    StaticFiles(directory=POSTER_DIR),
-    name="posters"
-)
+app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
+app.mount("/posters", StaticFiles(directory=POSTER_DIR), name="posters")
 
 
-# ================= HEALTH =================
-
-@app.get("/health")
-@app.head("/health")  # ADDED HEAD support
-def health():
-    return {"status": "ok"}
-
-
-# ================= ROOT =================
+# ================= ROOT & HEALTH =================
 
 @app.get("/")
-@app.head("/")  # ADDED HEAD support (FIXES 405 ERROR)
-def root():
-    return {"status": "running"}
+@app.head("/")
+@app.options("/")
+async def root():
+    """API root endpoint"""
+    return {
+        "status": "running",
+        "version": "1.0.0",
+        "endpoints": [
+            "/health",
+            "/signup",
+            "/token",
+            "/user/info",
+            "/ai/chat",
+            "/ai/image",
+            "/ai/poster",
+            "/ai/humanize",
+            "/files/{file_type}/{filename}"
+        ]
+    }
+
+
+@app.get("/health")
+@app.head("/health")
+async def health():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "database": "connected"
+    }
+
+
+# ================= CATCH-ALL ROUTE =================
+
+@app.api_route("/{path_name:path}", methods=["GET", "HEAD", "OPTIONS"])
+async def catch_all(path_name: str, request: Request):
+    """Catch-all route for undefined paths"""
+    logger.info(f"⚠️ Undefined path: {path_name} with method {request.method}")
+    
+    if request.method == "HEAD":
+        return JSONResponse(content={}, status_code=200)
+    if request.method == "OPTIONS":
+        return JSONResponse(content={}, status_code=200)
+    
+    raise HTTPException(status_code=404, detail=f"Endpoint '/{path_name}' not found")
 
 
 # ================= SECURITY =================
 
 pwd = CryptContext(schemes=["bcrypt"])
-
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", auto_error=False)
 
 
@@ -238,11 +279,12 @@ def check_usage_limit(user: User, feature: str):
 
 def increment_usage(user: User, feature: str, db: Session):
     """Increment usage counter for a feature"""
-    setattr(user, f"{feature}_used", getattr(user, f"{feature}_used", 0) + 1)
+    current = getattr(user, f"{feature}_used", 0)
+    setattr(user, f"{feature}_used", current + 1)
     db.commit()
 
 
-# ================= SIGNUP =================
+# ================= AUTH ENDPOINTS =================
 
 class Signup(BaseModel):
     username: str
@@ -270,6 +312,7 @@ def signup(data: Signup, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(user)
 
+        logger.info(f"✅ New user signed up: {data.username}")
         return {"ok": True, "message": "User created successfully"}
     except HTTPException:
         raise
@@ -278,22 +321,18 @@ def signup(data: Signup, db: Session = Depends(get_db)):
         raise HTTPException(500, "Internal server error")
 
 
-# ================= LOGIN =================
-
 @app.post("/token")
 def login(form: OAuth2PasswordRequestForm = Depends(),
           db: Session = Depends(get_db)):
     try:
         user = db.query(User).filter(User.username == form.username).first()
         
-        if not user:
-            raise HTTPException(401, "Invalid username or password")
-        
-        if not verify_password(form.password, user.password_hash):
+        if not user or not verify_password(form.password, user.password_hash):
             raise HTTPException(401, "Invalid username or password")
 
         token = create_token({"sub": user.username})
         
+        logger.info(f"✅ User logged in: {user.username}")
         return {
             "access_token": token,
             "token_type": "bearer",
@@ -306,8 +345,6 @@ def login(form: OAuth2PasswordRequestForm = Depends(),
         logger.error(f"Login error: {str(e)}")
         raise HTTPException(500, "Internal server error")
 
-
-# ================= USER INFO =================
 
 @app.get("/user/info")
 def user_info(user: User = Depends(get_current_user)):
@@ -325,18 +362,16 @@ def user_info(user: User = Depends(get_current_user)):
     }
 
 
-# ================= CHAT =================
+# ================= AI ENDPOINTS =================
 
 @app.post("/ai/chat")
 async def chat(message: str = Form(...),
                user: User = Depends(get_current_user),
                db: Session = Depends(get_db)):
     try:
-        # Check usage limit
         if not check_usage_limit(user, "chat"):
             raise HTTPException(429, "Chat limit reached. Please upgrade your plan.")
         
-        # Call OpenAI
         res = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": message}],
@@ -344,10 +379,9 @@ async def chat(message: str = Form(...),
         )
         
         reply = res.choices[0].message.content
-        
-        # Increment usage
         increment_usage(user, "chat", db)
         
+        logger.info(f"✅ Chat completed for user: {user.username}")
         return {"reply": reply, "success": True}
     except HTTPException:
         raise
@@ -356,18 +390,14 @@ async def chat(message: str = Form(...),
         raise HTTPException(500, f"Server error: {str(e)}")
 
 
-# ================= IMAGE =================
-
 @app.post("/ai/image")
 async def image(prompt: str = Form(...),
                 user: User = Depends(get_current_user),
                 db: Session = Depends(get_db)):
     try:
-        # Check usage limit
         if not check_usage_limit(user, "image"):
             raise HTTPException(429, "Image generation limit reached. Please upgrade your plan.")
         
-        # Generate image
         response = client.images.generate(
             model="dall-e-2",
             prompt=prompt,
@@ -376,28 +406,25 @@ async def image(prompt: str = Form(...),
             n=1
         )
         
-        # Download image from URL
         img_url = response.data[0].url
         img_response = requests.get(img_url)
         
         if img_response.status_code != 200:
             raise HTTPException(500, "Failed to download generated image")
         
-        # Save image
         filename = f"{uuid.uuid4()}.png"
         path = os.path.join(OUTPUT_DIR, filename)
         
         with open(path, "wb") as f:
             f.write(img_response.content)
         
-        # Increment usage
         increment_usage(user, "image", db)
         
-        # Return full URL or path
         image_url = f"/outputs/{filename}"
         if BASE_URL:
             image_url = f"{BASE_URL}{image_url}"
-            
+        
+        logger.info(f"✅ Image generated for user: {user.username}")
         return {"image": image_url, "success": True}
     except HTTPException:
         raise
@@ -406,22 +433,17 @@ async def image(prompt: str = Form(...),
         raise HTTPException(500, f"Server error: {str(e)}")
 
 
-# ================= POSTER =================
-
 @app.post("/ai/poster")
 async def poster(prompt: str = Form(...),
                  style: str = Form("realistic"),
                  user: User = Depends(get_current_user),
                  db: Session = Depends(get_db)):
     try:
-        # Check usage limit
         if not check_usage_limit(user, "poster"):
             raise HTTPException(429, "Poster generation limit reached. Please upgrade your plan.")
         
-        # Enhance prompt for poster generation
         enhanced_prompt = f"Create a professional poster: {prompt}. Style: {style}, high quality, marketing poster design"
         
-        # Generate image
         response = client.images.generate(
             model="dall-e-2",
             prompt=enhanced_prompt,
@@ -430,28 +452,25 @@ async def poster(prompt: str = Form(...),
             n=1
         )
         
-        # Download image
         img_url = response.data[0].url
         img_response = requests.get(img_url)
         
         if img_response.status_code != 200:
             raise HTTPException(500, "Failed to download generated poster")
         
-        # Save poster
         filename = f"poster_{uuid.uuid4()}.png"
         path = os.path.join(POSTER_DIR, filename)
         
         with open(path, "wb") as f:
             f.write(img_response.content)
         
-        # Increment usage
         increment_usage(user, "poster", db)
         
-        # Return full URL or path
         poster_url = f"/posters/{filename}"
         if BASE_URL:
             poster_url = f"{BASE_URL}{poster_url}"
-            
+        
+        logger.info(f"✅ Poster generated for user: {user.username}")
         return {"poster": poster_url, "success": True}
     except HTTPException:
         raise
@@ -460,32 +479,27 @@ async def poster(prompt: str = Form(...),
         raise HTTPException(500, f"Server error: {str(e)}")
 
 
-# ================= HUMANIZE =================
-
 @app.post("/ai/humanize")
 async def humanize(text: str = Form(...),
                    user: User = Depends(get_current_user),
                    db: Session = Depends(get_db)):
     try:
-        # Check usage limit
         if not check_usage_limit(user, "humanize"):
             raise HTTPException(429, "Humanize limit reached. Please upgrade your plan.")
         
-        # Humanize text using GPT
         res = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are a text humanizer. Make the given text more natural, conversational, and human-like while preserving the original meaning."},
+                {"role": "system", "content": "You are a text humanizer. Make the given text more natural and conversational."},
                 {"role": "user", "content": text}
             ],
             max_tokens=1000
         )
         
         humanized_text = res.choices[0].message.content
-        
-        # Increment usage
         increment_usage(user, "humanize", db)
         
+        logger.info(f"✅ Text humanized for user: {user.username}")
         return {"humanized": humanized_text, "success": True}
     except HTTPException:
         raise
@@ -526,6 +540,23 @@ async def general_exception_handler(request: Request, exc: Exception):
         status_code=500,
         content={"detail": "Internal server error", "success": False}
     )
+
+
+# ================= STARTUP EVENT =================
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("🚀 Acinyx.AI API starting up...")
+    logger.info(f"📡 Database URL: {DATABASE_URL.split('@')[0] if '@' in DATABASE_URL else 'configured'}")
+    logger.info(f"🔑 OpenAI API: {'configured' if OPENAI_API_KEY else 'missing'}")
+    logger.info(f"🌐 Base URL: {BASE_URL or 'not set'}")
+    logger.info(f"📁 Output directory: {OUTPUT_DIR}")
+    logger.info(f"📁 Poster directory: {POSTER_DIR}")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("🛑 Acinyx.AI API shutting down...")
 
 
 # ================= RUN =================
