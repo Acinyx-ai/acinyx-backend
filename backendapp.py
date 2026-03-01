@@ -390,6 +390,7 @@ async def chat(message: str = Form(...),
         raise HTTPException(500, f"Server error: {str(e)}")
 
 
+# ================= FIXED IMAGE ENDPOINT =================
 @app.post("/ai/image")
 async def image(prompt: str = Form(...),
                 user: User = Depends(get_current_user),
@@ -398,16 +399,26 @@ async def image(prompt: str = Form(...),
         if not check_usage_limit(user, "image"):
             raise HTTPException(429, "Image generation limit reached. Please upgrade your plan.")
         
-        response = client.images.generate(
-            model="dall-e-2",
-            prompt=prompt,
-            size="1024x1024",
-            quality="standard",
-            n=1
-        )
+        # FIXED: Removed 'quality' parameter - DALL-E 2 doesn't support it
+        # Try DALL-E 3 first (better quality), fall back to DALL-E 2
+        try:
+            response = client.images.generate(
+                model="dall-e-3",  # Try DALL-E 3 first
+                prompt=prompt,
+                size="1024x1024",
+                n=1
+            )
+        except Exception as e:
+            logger.warning(f"DALL-E 3 failed, falling back to DALL-E 2: {e}")
+            response = client.images.generate(
+                model="dall-e-2",  # Fall back to DALL-E 2
+                prompt=prompt,
+                size="1024x1024",
+                n=1
+            )
         
         img_url = response.data[0].url
-        img_response = requests.get(img_url)
+        img_response = requests.get(img_url, timeout=30)
         
         if img_response.status_code != 200:
             raise HTTPException(500, "Failed to download generated image")
@@ -430,9 +441,13 @@ async def image(prompt: str = Form(...),
         raise
     except Exception as e:
         logger.error(f"Image generation error: {str(e)}")
-        raise HTTPException(500, f"Server error: {str(e)}")
+        error_message = str(e)
+        if "quota" in error_message.lower() or "billing" in error_message.lower():
+            raise HTTPException(429, "OpenAI API quota exceeded. Please check your billing details.")
+        raise HTTPException(500, f"Server error: {error_message}")
 
 
+# ================= FIXED POSTER ENDPOINT =================
 @app.post("/ai/poster")
 async def poster(prompt: str = Form(...),
                  style: str = Form("realistic"),
@@ -444,16 +459,26 @@ async def poster(prompt: str = Form(...),
         
         enhanced_prompt = f"Create a professional poster: {prompt}. Style: {style}, high quality, marketing poster design"
         
-        response = client.images.generate(
-            model="dall-e-2",
-            prompt=enhanced_prompt,
-            size="1024x1024",
-            quality="standard",
-            n=1
-        )
+        # FIXED: Removed 'quality' parameter
+        # Try DALL-E 3 first, fall back to DALL-E 2
+        try:
+            response = client.images.generate(
+                model="dall-e-3",
+                prompt=enhanced_prompt,
+                size="1024x1024",
+                n=1
+            )
+        except Exception as e:
+            logger.warning(f"DALL-E 3 failed for poster, falling back to DALL-E 2: {e}")
+            response = client.images.generate(
+                model="dall-e-2",
+                prompt=enhanced_prompt,
+                size="1024x1024",
+                n=1
+            )
         
         img_url = response.data[0].url
-        img_response = requests.get(img_url)
+        img_response = requests.get(img_url, timeout=30)
         
         if img_response.status_code != 200:
             raise HTTPException(500, "Failed to download generated poster")
@@ -476,7 +501,10 @@ async def poster(prompt: str = Form(...),
         raise
     except Exception as e:
         logger.error(f"Poster generation error: {str(e)}")
-        raise HTTPException(500, f"Server error: {str(e)}")
+        error_message = str(e)
+        if "quota" in error_message.lower() or "billing" in error_message.lower():
+            raise HTTPException(429, "OpenAI API quota exceeded. Please check your billing details.")
+        raise HTTPException(500, f"Server error: {error_message}")
 
 
 @app.post("/ai/humanize")
@@ -490,7 +518,7 @@ async def humanize(text: str = Form(...),
         res = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are a text humanizer. Make the given text more natural and conversational."},
+                {"role": "system", "content": "You are a text humanizer. Make the given text more natural and conversational while preserving the original meaning."},
                 {"role": "user", "content": text}
             ],
             max_tokens=1000
@@ -552,6 +580,14 @@ async def startup_event():
     logger.info(f"🌐 Base URL: {BASE_URL or 'not set'}")
     logger.info(f"📁 Output directory: {OUTPUT_DIR}")
     logger.info(f"📁 Poster directory: {POSTER_DIR}")
+    
+    # Test OpenAI API connection
+    try:
+        # Simple test to check if API key is valid
+        client.models.list()
+        logger.info("✅ OpenAI API connection successful")
+    except Exception as e:
+        logger.error(f"❌ OpenAI API connection failed: {e}")
 
 
 @app.on_event("shutdown")
