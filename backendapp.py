@@ -1,16 +1,16 @@
 # ================= IMPORTS =================
 
-from fastapi import FastAPI, HTTPException, Depends, Form
+from fastapi import FastAPI, HTTPException, Depends, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.responses import JSONResponse, FileResponse
-from fastapi import Request
 
 from pydantic import BaseModel, EmailStr
 
-from sqlalchemy import Column, Integer, String, create_engine, or_
+from sqlalchemy import Column, Integer, String, create_engine, or_, DateTime, Boolean
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
+from sqlalchemy.sql import func
 
 from passlib.context import CryptContext
 
@@ -24,6 +24,8 @@ import base64
 import uuid
 import logging
 import requests
+import hmac
+import hashlib
 
 from openai import OpenAI
 
@@ -46,10 +48,17 @@ JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_SECRET")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_DAYS = 30
 
+# Paystack Configuration
+PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
+PAYSTACK_PUBLIC_KEY = os.getenv("PAYSTACK_PUBLIC_KEY")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+
 if not DATABASE_URL:
     raise Exception("DATABASE_URL missing")
 if not OPENAI_API_KEY:
     raise Exception("OPENAI_API_KEY missing")
+if not PAYSTACK_SECRET_KEY:
+    raise Exception("PAYSTACK_SECRET_KEY missing")
 
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -64,6 +73,12 @@ PLAN_LIMITS = {
     "basic": {"chat": -1, "image": 50, "poster": 50, "humanize": 100},
     "pro": {"chat": -1, "image": 200, "poster": 200, "humanize": -1},
     "mega": {"chat": -1, "image": -1, "poster": -1, "humanize": -1}
+}
+
+PLAN_PRICES = {
+    "basic": 25000,  # in kobo (250 KES = 25000 kobo)
+    "pro": 50000,    # 500 KES = 50000 kobo
+    "mega": 150000   # 1500 KES = 150000 kobo
 }
 
 
@@ -105,10 +120,26 @@ class User(Base):
     email = Column(String, unique=True)
     password_hash = Column(String)
     plan = Column(String, default="free")
+    plan_expiry = Column(DateTime, nullable=True)
     chat_used = Column(Integer, default=0)
     image_used = Column(Integer, default=0)
     poster_used = Column(Integer, default=0)
     humanize_used = Column(Integer, default=0)
+    created_at = Column(DateTime, server_default=func.now())
+
+
+class Payment(Base):
+    __tablename__ = "payments"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer)
+    email = Column(String)
+    plan = Column(String)
+    amount = Column(Integer)
+    reference = Column(String, unique=True)
+    status = Column(String, default="pending")  # pending, success, failed
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
 
 
 Base.metadata.create_all(bind=engine)
@@ -183,6 +214,9 @@ async def root():
             "/ai/image",
             "/ai/poster",
             "/ai/humanize",
+            "/payments/paystack/init",
+            "/payments/paystack/webhook",
+            "/payments/verify/{reference}",
             "/files/{file_type}/{filename}"
         ]
     }
@@ -197,21 +231,6 @@ async def health():
         "timestamp": datetime.utcnow().isoformat(),
         "database": "connected"
     }
-
-
-# ================= CATCH-ALL ROUTE =================
-
-@app.api_route("/{path_name:path}", methods=["GET", "HEAD", "OPTIONS"])
-async def catch_all(path_name: str, request: Request):
-    """Catch-all route for undefined paths"""
-    logger.info(f"⚠️ Undefined path: {path_name} with method {request.method}")
-    
-    if request.method == "HEAD":
-        return JSONResponse(content={}, status_code=200)
-    if request.method == "OPTIONS":
-        return JSONResponse(content={}, status_code=200)
-    
-    raise HTTPException(status_code=404, detail=f"Endpoint '/{path_name}' not found")
 
 
 # ================= SECURITY =================
@@ -259,6 +278,12 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
     user = db.query(User).filter(User.username == username).first()
     if user is None:
         raise HTTPException(status_code=401, detail="User not found")
+    
+    # Check if plan has expired
+    if user.plan != "free" and user.plan_expiry and user.plan_expiry < datetime.utcnow():
+        user.plan = "free"
+        user.plan_expiry = None
+        db.commit()
     
     return user
 
@@ -352,6 +377,7 @@ def user_info(user: User = Depends(get_current_user)):
         "username": user.username,
         "email": user.email,
         "plan": user.plan,
+        "plan_expiry": user.plan_expiry.isoformat() if user.plan_expiry else None,
         "usage": {
             "chat": user.chat_used,
             "image": user.image_used,
@@ -390,7 +416,6 @@ async def chat(message: str = Form(...),
         raise HTTPException(500, f"Server error: {str(e)}")
 
 
-# ================= FIXED IMAGE ENDPOINT =================
 @app.post("/ai/image")
 async def image(prompt: str = Form(...),
                 user: User = Depends(get_current_user),
@@ -399,11 +424,10 @@ async def image(prompt: str = Form(...),
         if not check_usage_limit(user, "image"):
             raise HTTPException(429, "Image generation limit reached. Please upgrade your plan.")
         
-        # FIXED: Removed 'quality' parameter - DALL-E 2 doesn't support it
-        # Try DALL-E 3 first (better quality), fall back to DALL-E 2
+        # Try DALL-E 3 first, fall back to DALL-E 2
         try:
             response = client.images.generate(
-                model="dall-e-3",  # Try DALL-E 3 first
+                model="dall-e-3",
                 prompt=prompt,
                 size="1024x1024",
                 n=1
@@ -411,7 +435,7 @@ async def image(prompt: str = Form(...),
         except Exception as e:
             logger.warning(f"DALL-E 3 failed, falling back to DALL-E 2: {e}")
             response = client.images.generate(
-                model="dall-e-2",  # Fall back to DALL-E 2
+                model="dall-e-2",
                 prompt=prompt,
                 size="1024x1024",
                 n=1
@@ -447,7 +471,6 @@ async def image(prompt: str = Form(...),
         raise HTTPException(500, f"Server error: {error_message}")
 
 
-# ================= FIXED POSTER ENDPOINT =================
 @app.post("/ai/poster")
 async def poster(prompt: str = Form(...),
                  style: str = Form("realistic"),
@@ -459,7 +482,6 @@ async def poster(prompt: str = Form(...),
         
         enhanced_prompt = f"Create a professional poster: {prompt}. Style: {style}, high quality, marketing poster design"
         
-        # FIXED: Removed 'quality' parameter
         # Try DALL-E 3 first, fall back to DALL-E 2
         try:
             response = client.images.generate(
@@ -536,6 +558,225 @@ async def humanize(text: str = Form(...),
         raise HTTPException(500, f"Server error: {str(e)}")
 
 
+# ================= PAYMENT ENDPOINTS =================
+
+class PaymentInit(BaseModel):
+    plan: str
+    amount: int  # in kobo
+
+
+@app.post("/payments/paystack/init")
+async def init_payment(
+    payment_data: PaymentInit,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Initialize Paystack payment"""
+    try:
+        if payment_data.plan not in ["basic", "pro", "mega"]:
+            raise HTTPException(400, "Invalid plan")
+        
+        # Verify amount matches plan price
+        expected_amount = PLAN_PRICES.get(payment_data.plan)
+        if not expected_amount or payment_data.amount != expected_amount:
+            raise HTTPException(400, "Invalid amount for selected plan")
+        
+        # Generate unique reference
+        reference = f"ACINYX-{uuid.uuid4().hex[:8].upper()}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+        
+        # Create payment record
+        payment = Payment(
+            user_id=user.id,
+            email=user.email,
+            plan=payment_data.plan,
+            amount=payment_data.amount,
+            reference=reference,
+            status="pending"
+        )
+        db.add(payment)
+        db.commit()
+        
+        # Initialize Paystack transaction
+        headers = {
+            "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "email": user.email,
+            "amount": payment_data.amount,
+            "reference": reference,
+            "callback_url": f"{FRONTEND_URL}/payment/verify?reference={reference}",
+            "metadata": {
+                "user_id": user.id,
+                "username": user.username,
+                "plan": payment_data.plan
+            }
+        }
+        
+        response = requests.post(
+            "https://api.paystack.co/transaction/initialize",
+            json=payload,
+            headers=headers,
+            timeout=10
+        )
+        
+        if response.status_code != 200:
+            logger.error(f"Paystack init failed: {response.text}")
+            raise HTTPException(500, "Failed to initialize payment")
+        
+        data = response.json()
+        
+        if not data.get("status"):
+            raise HTTPException(500, data.get("message", "Payment initialization failed"))
+        
+        logger.info(f"✅ Payment initialized for user: {user.username}, reference: {reference}")
+        
+        return {
+            "authorization_url": data["data"]["authorization_url"],
+            "reference": reference,
+            "success": True
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Payment init error: {str(e)}")
+        raise HTTPException(500, f"Payment initialization failed: {str(e)}")
+
+
+@app.post("/payments/paystack/webhook")
+async def paystack_webhook(request: Request, db: Session = Depends(get_db)):
+    """Handle Paystack webhook"""
+    try:
+        # Get signature from header
+        signature = request.headers.get("x-paystack-signature")
+        
+        # Get request body
+        body = await request.body()
+        
+        # Verify webhook signature
+        hash = hmac.new(
+            PAYSTACK_SECRET_KEY.encode(),
+            body,
+            hashlib.sha512
+        ).hexdigest()
+        
+        if signature != hash:
+            logger.warning("Invalid webhook signature")
+            return JSONResponse(status_code=400, content={"status": "invalid signature"})
+        
+        # Parse webhook data
+        data = await request.json()
+        
+        event = data.get("event")
+        webhook_data = data.get("data", {})
+        
+        if event == "charge.success":
+            reference = webhook_data.get("reference")
+            status = webhook_data.get("status")
+            amount = webhook_data.get("amount")
+            
+            # Find payment record
+            payment = db.query(Payment).filter(Payment.reference == reference).first()
+            
+            if not payment:
+                logger.error(f"Payment not found for reference: {reference}")
+                return JSONResponse(status_code=404, content={"status": "payment not found"})
+            
+            if status == "success":
+                # Update payment status
+                payment.status = "success"
+                
+                # Find user and upgrade plan
+                user = db.query(User).filter(User.id == payment.user_id).first()
+                if user:
+                    # Set plan and expiry (30 days from now)
+                    user.plan = payment.plan
+                    user.plan_expiry = datetime.utcnow() + timedelta(days=30)
+                    
+                    # Reset usage counters for new billing period
+                    user.chat_used = 0
+                    user.image_used = 0
+                    user.poster_used = 0
+                    user.humanize_used = 0
+                    
+                    db.commit()
+                    
+                    logger.info(f"✅ User {user.username} upgraded to {payment.plan} plan")
+            
+            db.commit()
+        
+        return JSONResponse(status_code=200, content={"status": "success"})
+        
+    except Exception as e:
+        logger.error(f"Webhook error: {str(e)}")
+        return JSONResponse(status_code=500, content={"status": "error"})
+
+
+@app.get("/payments/verify/{reference}")
+async def verify_payment(reference: str, db: Session = Depends(get_db)):
+    """Verify payment status"""
+    try:
+        # Check local payment record
+        payment = db.query(Payment).filter(Payment.reference == reference).first()
+        
+        if not payment:
+            raise HTTPException(404, "Payment not found")
+        
+        # Verify with Paystack
+        headers = {
+            "Authorization": f"Bearer {PAYSTACK_SECRET_KEY}"
+        }
+        
+        response = requests.get(
+            f"https://api.paystack.co/transaction/verify/{reference}",
+            headers=headers,
+            timeout=10
+        )
+        
+        if response.status_code != 200:
+            logger.error(f"Paystack verify failed: {response.text}")
+            raise HTTPException(500, "Failed to verify payment")
+        
+        data = response.json()
+        
+        if not data.get("status"):
+            raise HTTPException(400, data.get("message", "Payment verification failed"))
+        
+        paystack_status = data["data"]["status"]
+        
+        # Update payment status if needed
+        if paystack_status == "success" and payment.status != "success":
+            payment.status = "success"
+            
+            # Update user plan
+            user = db.query(User).filter(User.id == payment.user_id).first()
+            if user:
+                user.plan = payment.plan
+                user.plan_expiry = datetime.utcnow() + timedelta(days=30)
+                user.chat_used = 0
+                user.image_used = 0
+                user.poster_used = 0
+                user.humanize_used = 0
+            
+            db.commit()
+        
+        return {
+            "status": payment.status,
+            "plan": payment.plan,
+            "amount": payment.amount,
+            "reference": payment.reference,
+            "success": True
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Payment verification error: {str(e)}")
+        raise HTTPException(500, f"Verification failed: {str(e)}")
+
+
 # ================= FILE SERVER =================
 
 @app.get("/files/{file_type}/{filename}")
@@ -577,17 +818,28 @@ async def startup_event():
     logger.info("🚀 Acinyx.AI API starting up...")
     logger.info(f"📡 Database URL: {DATABASE_URL.split('@')[0] if '@' in DATABASE_URL else 'configured'}")
     logger.info(f"🔑 OpenAI API: {'configured' if OPENAI_API_KEY else 'missing'}")
+    logger.info(f"💰 Paystack: {'configured' if PAYSTACK_SECRET_KEY else 'missing'}")
     logger.info(f"🌐 Base URL: {BASE_URL or 'not set'}")
     logger.info(f"📁 Output directory: {OUTPUT_DIR}")
     logger.info(f"📁 Poster directory: {POSTER_DIR}")
     
     # Test OpenAI API connection
     try:
-        # Simple test to check if API key is valid
         client.models.list()
         logger.info("✅ OpenAI API connection successful")
     except Exception as e:
         logger.error(f"❌ OpenAI API connection failed: {e}")
+    
+    # Test Paystack API connection
+    try:
+        headers = {"Authorization": f"Bearer {PAYSTACK_SECRET_KEY}"}
+        response = requests.get("https://api.paystack.co/balance", headers=headers, timeout=10)
+        if response.status_code == 200:
+            logger.info("✅ Paystack API connection successful")
+        else:
+            logger.error(f"❌ Paystack API connection failed: {response.status_code}")
+    except Exception as e:
+        logger.error(f"❌ Paystack API connection failed: {e}")
 
 
 @app.on_event("shutdown")
